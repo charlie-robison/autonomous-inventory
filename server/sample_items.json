@@ -1,0 +1,42 @@
+[
+  {
+    "Name": "Ruby Gem",
+    "Desc": "A polished precious stone with deep red hues",
+    "Color": "Red",
+    "Shape": "Oval",
+    "Price": 249.99,
+    "Type": "Gemstone"
+  },
+  {
+    "Name": "Sapphire Ring",
+    "Desc": "A brilliant blue sapphire set in silver",
+    "Color": "Blue",
+    "Shape": "Round",
+    "Price": 399.50,
+    "Type": "Jewelry"
+  },
+  {
+    "Name": "Emerald Pendant",
+    "Desc": "A vibrant green emerald on a gold chain",
+    "Color": "Green",
+    "Shape": "Rectangle",
+    "Price": 549.00,
+    "Type": "Jewelry"
+  },
+  {
+    "Name": "Amber Cube",
+    "Desc": "A fossilized resin cube with natural inclusions",
+    "Color": "Orange",
+    "Shape": "Square",
+    "Price": 89.99,
+    "Type": "Collectible"
+  },
+  {
+    "Name": "Diamond Stud",
+    "Desc": "A clear brilliant-cut diamond earring",
+    "Color": "White",
+    "Shape": "Triangle",
+    "Price": 1299.00,
+    "Type": "Jewelry"
+  }
+]
