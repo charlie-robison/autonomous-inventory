@@ -14,7 +14,7 @@ _model = None
 def _get_model() -> WhisperModel:
     global _model
     if _model is None:
-        _model = WhisperModel("small", device="cpu", compute_type="int8")
+        _model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _model
 
 

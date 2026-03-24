@@ -30,6 +30,7 @@ async def audio_stream(websocket: WebSocket):
             {"type": "error", "message": "..."}
     """
     await websocket.accept()
+    logger.info("=== AUDIO WS: client connected ===")
 
     # Audio config defaults (phone mic typically sends 16kHz 16-bit mono)
     sample_rate = 16000
@@ -40,21 +41,32 @@ async def audio_stream(websocket: WebSocket):
     audio_buffer = bytearray()
 
     await websocket.send_json({"type": "status", "message": "ready"})
+    logger.info("AUDIO WS: sent ready")
 
     try:
         while True:
             message = await websocket.receive()
+            msg_type = message.get("type", "unknown")
+
+            # Handle WebSocket disconnect message
+            if msg_type == "websocket.disconnect":
+                logger.info("AUDIO WS: received disconnect message")
+                break
 
             # Binary message = raw PCM audio chunk
             if "bytes" in message:
+                chunk_len = len(message["bytes"])
                 audio_buffer.extend(message["bytes"])
+                logger.info("AUDIO WS: received %d bytes of audio (buffer now %d bytes)", chunk_len, len(audio_buffer))
                 continue
 
             # Text message = JSON command
             if "text" in message:
+                logger.info("AUDIO WS: received text: %s", message["text"][:200])
                 try:
                     data = __import__("json").loads(message["text"])
                 except (ValueError, TypeError):
+                    logger.warning("AUDIO WS: invalid JSON")
                     await websocket.send_json({
                         "type": "error",
                         "message": "Invalid JSON",
@@ -62,9 +74,11 @@ async def audio_stream(websocket: WebSocket):
                     continue
 
                 action = data.get("action")
+                logger.info("AUDIO WS: action=%s", action)
 
                 if action == "transcribe":
                     if not audio_buffer:
+                        logger.info("AUDIO WS: buffer empty, returning empty transcription")
                         await websocket.send_json({
                             "type": "transcription",
                             "text": "",
@@ -72,6 +86,7 @@ async def audio_stream(websocket: WebSocket):
                         })
                         continue
 
+                    logger.info("AUDIO WS: transcribing %d bytes of audio...", len(audio_buffer))
                     wav_bytes = _pcm_to_wav(
                         bytes(audio_buffer), sample_rate, channels, sample_width,
                     )
@@ -79,8 +94,9 @@ async def audio_stream(websocket: WebSocket):
 
                     try:
                         text = transcribe_audio(wav_bytes)
+                        logger.info("AUDIO WS: transcription result: %r (%.1fs audio)", text, duration)
                     except Exception as e:
-                        logger.error("Transcription error: %s", e)
+                        logger.error("AUDIO WS: transcription error: %s", e)
                         await websocket.send_json({
                             "type": "error",
                             "message": f"Transcription failed: {e}",
@@ -116,15 +132,19 @@ async def audio_stream(websocket: WebSocket):
                     })
 
                 else:
+                    logger.warning("AUDIO WS: unknown action: %s", action)
                     await websocket.send_json({
                         "type": "error",
                         "message": f"Unknown action: {action}",
                     })
 
+            else:
+                logger.warning("AUDIO WS: unexpected message type: %s keys=%s", msg_type, list(message.keys()))
+
     except WebSocketDisconnect:
-        logger.info("Audio stream client disconnected")
+        logger.info("AUDIO WS: client disconnected (WebSocketDisconnect)")
     except Exception:
-        logger.exception("Audio stream error")
+        logger.exception("AUDIO WS: error")
 
 
 def _pcm_to_wav(

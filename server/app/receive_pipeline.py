@@ -10,7 +10,7 @@ Flow (business logic only — WebSocket/glasses streaming handled elsewhere):
 """
 
 from app.database import (
-    get_pallet,
+    get_or_create_pallet,
     get_warehouse_by_name,
     create_warehouse,
     update_pallet,
@@ -41,11 +41,11 @@ def resolve_warehouse_from_geo(lat: float, lon: float) -> str | None:
     return None
 
 
-async def receive_pallet(pallet_id: str, lat: float, lon: float) -> dict:
+async def receive_pallet(pallet_name: str, lat: float, lon: float) -> dict:
     """Execute the full receive pipeline for a single pallet.
 
     Args:
-        pallet_id: The pallet's database id (from QR code).
+        pallet_name: The pallet name from QR code (e.g. "H123").
         lat: GPS latitude of the receiving location.
         lon: GPS longitude of the receiving location.
 
@@ -53,12 +53,10 @@ async def receive_pallet(pallet_id: str, lat: float, lon: float) -> dict:
         The updated pallet document.
 
     Raises:
-        ValueError: If pallet not found or geo coordinates can't be resolved.
+        ValueError: If geo coordinates can't be resolved.
     """
-    # 1. Look up pallet
-    pallet = await get_pallet(pallet_id)
-    if pallet is None:
-        raise ValueError(f"Pallet '{pallet_id}' not found in database")
+    # 1. Find or create pallet by name
+    pallet = await get_or_create_pallet(pallet_name)
 
     # 2. Resolve warehouse from geo
     warehouse_name = resolve_warehouse_from_geo(lat, lon)
@@ -74,11 +72,12 @@ async def receive_pallet(pallet_id: str, lat: float, lon: float) -> dict:
         warehouse = await create_warehouse(warehouse_name)
 
     # 4. Update pallet: status=received, warehouse_fk=warehouse id, vehicle_fk=null
-    updated = await update_pallet(pallet_id, {
+    updated = await update_pallet(pallet["id"], {
         "status": "received",
         "warehouse_fk": warehouse["id"],
         "vehicle_fk": None,
     })
+    updated["warehouse_name"] = warehouse_name
     return updated
 
 
@@ -99,8 +98,8 @@ async def receive_pallet_from_frame(image_bytes: bytes, lat: float, lon: float) 
     if qr_data is None:
         raise ValueError("No QR code detected in frame")
 
-    pallet_id = qr_data.get("pallet_id")
-    if pallet_id is None:
-        raise ValueError(f"QR code does not contain a pallet_id: {qr_data}")
+    pallet_name = qr_data.get("pallet_id")
+    if pallet_name is None:
+        raise ValueError(f"QR code does not contain a pallet name: {qr_data}")
 
-    return await receive_pallet(pallet_id, lat, lon)
+    return await receive_pallet(pallet_name, lat, lon)

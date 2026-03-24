@@ -2,8 +2,9 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -30,6 +31,9 @@ from app.audio_router import router as audio_router
 from app.stream_router import router as stream_router
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
+FRONTEND_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "out"
+)
 
 
 @asynccontextmanager
@@ -75,6 +79,8 @@ items: list[Item] = []
 
 @app.get("/")
 def root():
+    if os.path.isdir(FRONTEND_DIR):
+        return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
     return {"message": "Autonomous Inventory API"}
 
 
@@ -188,25 +194,26 @@ async def api_get_warehouses():
 # ---------------------------------------------------------------------------
 
 class PalletCreate(BaseModel):
+    name: str
     status: str = "on_port"
     warehouse_fk: Optional[str] = None
     vehicle_fk: Optional[str] = None
 
 
 class ReceivePalletRequest(BaseModel):
-    pallet_id: str
+    pallet_id: str  # pallet name from QR code (e.g. "H123")
     lat: float
     lon: float
 
 
 class LoadPalletRequest(BaseModel):
-    pallet_id: str
+    pallet_id: str  # pallet name from QR code (e.g. "H123")
     vehicle_name: str
 
 
 @app.post("/api/pallets")
 async def api_create_pallet(body: PalletCreate):
-    return await create_pallet(body.status, body.warehouse_fk, body.vehicle_fk)
+    return await create_pallet(name=body.name, status=body.status, warehouse_fk=body.warehouse_fk, vehicle_fk=body.vehicle_fk)
 
 
 @app.get("/api/pallets")
@@ -238,3 +245,31 @@ async def api_load_pallet(body: LoadPalletRequest):
         return await load_pallet(body.pallet_id, body.vehicle_name)
     except ValueError as e:
         return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Serve the Next.js static export (must be after all API/WS routes)
+# ---------------------------------------------------------------------------
+
+if os.path.isdir(FRONTEND_DIR):
+    # Serve known sub-pages as HTML
+    @app.get("/inventory")
+    async def _inventory_page():
+        return FileResponse(os.path.join(FRONTEND_DIR, "inventory.html"))
+
+    @app.get("/stream")
+    async def _stream_page():
+        return FileResponse(os.path.join(FRONTEND_DIR, "stream.html"))
+
+    # Serve static assets (_next/*, etc.)
+    app.mount("/_next", StaticFiles(directory=os.path.join(FRONTEND_DIR, "_next")), name="frontend_next")
+
+    # Catch-all: serve index.html for the root and any unknown paths (SPA fallback)
+    @app.get("/{full_path:path}")
+    async def _spa_fallback(request: Request, full_path: str):
+        # Try exact file first
+        file_path = os.path.join(FRONTEND_DIR, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        # Fallback to index.html
+        return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
