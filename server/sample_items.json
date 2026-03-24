@@ -5,7 +5,10 @@
     "Color": "Red",
     "Shape": "Oval",
     "Price": 249.99,
-    "Type": "Gemstone"
+    "Type": "Gemstone",
+    "Count":3,
+    "Confidence_Level":90.99,
+    "Explanation": "why this confidence level that value"
   },
   {
     "Name": "Sapphire Ring",
@@ -13,7 +16,10 @@
     "Color": "Blue",
     "Shape": "Round",
     "Price": 399.50,
-    "Type": "Jewelry"
+    "Type": "Jewelry",
+    "Count":3,
+    "Confidence_Level":90.99,
+    "Explanation": "why this confidence level that value"
   },
   {
     "Name": "Emerald Pendant",
@@ -21,7 +27,10 @@
     "Color": "Green",
     "Shape": "Rectangle",
     "Price": 549.00,
-    "Type": "Jewelry"
+    "Type": "Jewelry",
+    "Count":3,
+    "Confidence_Level":90.99,
+    "Explanation": "why this confidence level that value"
   },
   {
     "Name": "Amber Cube",
@@ -29,7 +38,10 @@
     "Color": "Orange",
     "Shape": "Square",
     "Price": 89.99,
-    "Type": "Collectible"
+    "Type": "Collectible",
+    "Count":3,
+    "Confidence_Level":90.99,
+    "Explanation": "why this confidence level that value"
   },
   {
     "Name": "Diamond Stud",
@@ -37,6 +49,9 @@
     "Color": "White",
     "Shape": "Triangle",
     "Price": 1299.00,
-    "Type": "Jewelry"
+    "Type": "Jewelry",
+    "Count":3,
+    "Confidence_Level":90.99,
+    "Explanation": "why this confidence level that value"
   }
 ]
