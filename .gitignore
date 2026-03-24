@@ -18,5 +18,11 @@ frontend/out/
 # Environment
 .env
 
+# Frame dumps
+server/test/
+
+# Xcode (regenerate via: cd ios/InventoryGlasses && xcodegen generate)
+ios/InventoryGlasses/InventoryGlasses.xcodeproj/
+
 # OS
 .DS_Store

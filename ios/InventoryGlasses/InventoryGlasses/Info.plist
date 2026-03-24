@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>InventoryGlasses needs Bluetooth to communicate with your Meta Ray-Ban glasses.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>InventoryGlasses uses Bluetooth to receive video frames from your Meta Ray-Ban glasses.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>InventoryGlasses uses the camera to capture frames for inventory scanning (used as fallback when glasses are not connected).</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>InventoryGlasses sends video frames to your inventory server over the local network.</string>
+    <key>UISupportedExternalAccessoryProtocols</key>
+    <array>
+        <string>com.meta.wearables</string>
+    </array>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>bluetooth-central</string>
+        <string>external-accessory</string>
+    </array>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>inventoryglasses</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
