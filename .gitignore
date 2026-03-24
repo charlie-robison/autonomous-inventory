@@ -15,5 +15,8 @@ frontend/out/
 .vscode/
 .idea/
 
+# Environment
+.env
+
 # OS
 .DS_Store

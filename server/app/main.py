@@ -1,10 +1,21 @@
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Autonomous Inventory API")
+from app.database import add_or_increment_item, connect_db, close_db, get_inventory_collection
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_db()
+    yield
+    await close_db()
+
+
+app = FastAPI(title="Autonomous Inventory API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,6 +31,11 @@ class Item(BaseModel):
     name: str
     description: str = ""
     quantity: int = 0
+
+
+class InventoryUpdate(BaseModel):
+    name: str
+    count: int = 1
 
 
 # In-memory placeholder list
@@ -45,3 +61,18 @@ def get_items():
 def create_item(item: Item):
     items.append(item)
     return item
+
+
+@app.post("/api/inventory")
+async def update_inventory(update: InventoryUpdate):
+    """Add a new item to inventory count or increment an existing item's count."""
+    result = await add_or_increment_item(update.name, update.count)
+    return result
+
+
+@app.get("/api/inventory")
+async def get_inventory():
+    """Get all inventory counts."""
+    collection = get_inventory_collection()
+    cursor = collection.find({}, {"_id": 0, "name": 1, "count": 1})
+    return await cursor.to_list(length=None)
