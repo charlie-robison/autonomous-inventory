@@ -5,7 +5,10 @@
     "Color": "Red",
     "Shape": "Oval",
     "Price": 249.99,
-    "Type": "Gemstone"
+    "Type": "Gemstone",
+    "Count": 2,
+    "Confidence_Level": 78,
+    "Explanation": "Identified as a ruby based on its deep red coloration and oval cut pattern. Minor inclusions suggest natural origin rather than synthetic."
   },
   {
     "Name": "Sapphire Ring",
@@ -13,7 +16,10 @@
     "Color": "Blue",
     "Shape": "Round",
     "Price": 399.50,
-    "Type": "Jewelry"
+    "Type": "Jewelry",
+    "Count": 5,
+    "Confidence_Level": 83,
+    "Explanation": "Ring setting appears to be sterling silver with a round-cut blue sapphire. Band markings and stone clarity are consistent with mid-range jewelry."
   },
   {
     "Name": "Emerald Pendant",
@@ -21,7 +27,10 @@
     "Color": "Green",
     "Shape": "Rectangle",
     "Price": 549.00,
-    "Type": "Jewelry"
+    "Type": "Jewelry",
+    "Count": 6,
+    "Confidence_Level": 90,
+    "Explanation": "Vibrant green hue and rectangular cut are characteristic of a Colombian emerald. Gold chain tested as 14k. High confidence due to distinct color saturation."
   },
   {
     "Name": "Amber Cube",
@@ -29,7 +38,10 @@
     "Color": "Orange",
     "Shape": "Square",
     "Price": 89.99,
-    "Type": "Collectible"
+    "Type": "Collectible",
+    "Count": 5,
+    "Confidence_Level": 98,
+    "Explanation": "Fossilized resin with visible insect inclusions and warm orange tones. Uniform cube shape indicates deliberate cutting. Very high confidence due to distinctive amber characteristics."
   },
   {
     "Name": "Diamond Stud",
@@ -37,6 +49,9 @@
     "Color": "White",
     "Shape": "Triangle",
     "Price": 1299.00,
-    "Type": "Jewelry"
+    "Type": "Jewelry",
+    "Count": 2,
+    "Confidence_Level": 95,
+    "Explanation": "Brilliant-cut diamond with exceptional clarity and light refraction. Triangle shape of the stud setting is distinctive. High confidence based on refractive index and hardness indicators."
   }
 ]

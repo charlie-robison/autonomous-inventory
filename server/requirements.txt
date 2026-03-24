@@ -3,3 +3,13 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 motor==3.6.0
 python-dotenv==1.0.1
+python-multipart==0.0.12
+av==14.0.1
+httpx==0.28.1
+Pillow==11.1.0
+yt-dlp==2024.12.23
+mss==9.0.2
+pyobjc-framework-Quartz==10.3.1
+faster-whisper==1.1.0
+pytest==8.3.3
+pytest-asyncio==0.24.0
