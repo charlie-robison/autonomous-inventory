@@ -26,8 +26,9 @@ FRONTEND_DIR = os.path.join(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    database.init_db()
+    await database.init_db()
     yield
+    await database.close_db()
 
 
 app = FastAPI(title="Autonomous Inventory API", lifespan=lifespan)
@@ -68,13 +69,13 @@ class ModeRequest(BaseModel):
 
 
 @app.get("/api/mode")
-def get_mode():
-    return {"mode": database.get_current_mode()}
+async def get_mode():
+    return {"current_mode": await database.get_current_mode()}
 
 
 @app.post("/api/mode")
-def set_mode(req: ModeRequest):
-    result = database.set_current_mode(req.mode)
+async def set_mode(req: ModeRequest):
+    result = await database.set_current_mode(req.mode)
     if not result:
         raise HTTPException(
             status_code=400,
@@ -87,16 +88,16 @@ def set_mode(req: ModeRequest):
 
 
 @app.get("/api/warehouses")
-def get_warehouses():
-    return database.get_warehouses()
+async def get_warehouses():
+    return await database.get_warehouses()
 
 
 # ---------- Vehicles ----------
 
 
 @app.get("/api/vehicles")
-def get_vehicles():
-    return database.get_vehicles()
+async def get_vehicles():
+    return await database.get_vehicles()
 
 
 # ---------- Pallets ----------
@@ -112,29 +113,29 @@ class LoadRequest(BaseModel):
 
 
 @app.get("/api/pallets")
-def get_pallets(status: str | None = None):
-    return database.get_pallets(status)
+async def get_pallets(status: str | None = None):
+    return await database.get_pallets(status)
 
 
 @app.get("/api/pallets/{pallet_id}")
-def get_pallet(pallet_id: str):
-    pallet = database.get_pallet(pallet_id)
+async def get_pallet(pallet_id: str):
+    pallet = await database.get_pallet(pallet_id)
     if not pallet:
         raise HTTPException(status_code=404, detail="Pallet not found")
     return pallet
 
 
 @app.post("/api/pallets/{pallet_id}/receive")
-def receive_pallet(pallet_id: str, req: ReceiveRequest):
+async def receive_pallet(pallet_id: str, req: ReceiveRequest):
     """Set pallet to received. Uses geo coordinates to find nearest warehouse."""
     from datetime import datetime, timezone
 
-    warehouse = database.get_nearest_warehouse(req.lat, req.lng)
+    warehouse = await database.get_nearest_warehouse(req.lat, req.lng)
     if not warehouse:
         raise HTTPException(status_code=400, detail="No warehouses configured")
 
-    database.receive_pallet(pallet_id, warehouse["id"])
-    database.log_activity(
+    await database.receive_pallet(pallet_id, warehouse["id"])
+    await database.log_activity(
         "pallet_received",
         json.dumps({
             "pallet_id": pallet_id,
@@ -148,7 +149,8 @@ def receive_pallet(pallet_id: str, req: ReceiveRequest):
         "pallet_id": pallet_id,
         "action": "receive",
         "status": "received",
-        "warehouse_fk": f"WH-{warehouse['name'].upper().replace(' ', '-')}-{warehouse['id']:03d}",
+        "warehouse_id": warehouse["id"],
+        "warehouse_name": warehouse["name"],
         "vehicle_fk": None,
         "geo": {"lat": req.lat, "lng": req.lng},
         "island": warehouse["name"],
@@ -157,13 +159,13 @@ def receive_pallet(pallet_id: str, req: ReceiveRequest):
 
 
 @app.post("/api/pallets/{pallet_id}/load")
-def load_pallet(pallet_id: str, req: LoadRequest):
+async def load_pallet(pallet_id: str, req: LoadRequest):
     """Set pallet to loaded. Looks up or creates the vehicle."""
     from datetime import datetime, timezone
 
-    vehicle = database.get_or_create_vehicle(req.vehicle_name)
-    database.load_pallet(pallet_id, vehicle["id"])
-    database.log_activity(
+    vehicle = await database.get_or_create_vehicle(req.vehicle_name)
+    await database.load_pallet(pallet_id, vehicle["id"])
+    await database.log_activity(
         "pallet_loaded",
         json.dumps({
             "pallet_id": pallet_id,
@@ -177,8 +179,8 @@ def load_pallet(pallet_id: str, req: LoadRequest):
         "action": "load",
         "status": "loaded",
         "warehouse_fk": None,
-        "vehicle_fk": f"VH-{vehicle['id']:04d}",
-        "vehicle_num": vehicle["name"],
+        "vehicle_id": vehicle["id"],
+        "vehicle_name": vehicle["name"],
         "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
@@ -191,15 +193,15 @@ class DepthRequest(BaseModel):
 
 
 @app.get("/api/items")
-def get_items():
-    return database.get_items()
+async def get_items():
+    return await database.get_items()
 
 
 @app.post("/api/items/{item_id}/depth")
-def set_item_depth(item_id: int, req: DepthRequest):
+async def set_item_depth(item_id: str, req: DepthRequest):
     if req.depth < 1:
         raise HTTPException(status_code=400, detail="Depth must be at least 1")
-    result = database.set_item_depth(item_id, req.depth)
+    result = await database.set_item_depth(item_id, req.depth)
     if not result:
         raise HTTPException(status_code=404, detail="Item not found")
     return result
@@ -214,34 +216,34 @@ class ShelfDepthRequest(BaseModel):
 
 
 @app.get("/api/shelf-depths")
-def get_shelf_depths():
-    return database.get_shelf_depths()
+async def get_shelf_depths():
+    return await database.get_shelf_depths()
 
 
 @app.post("/api/shelf-depths")
-def set_shelf_depth(req: ShelfDepthRequest):
+async def set_shelf_depth(req: ShelfDepthRequest):
     if req.depth < 1:
         raise HTTPException(status_code=400, detail="Depth must be at least 1")
-    return database.set_shelf_depth(req.product_name, req.depth)
+    return await database.set_shelf_depth(req.product_name, req.depth)
 
 
 # ---------- Activity Log ----------
 
 
 @app.get("/api/activity")
-def get_activity(limit: int = 50):
-    return database.get_activity_log(limit)
+async def get_activity(limit: int = 50):
+    return await database.get_activity_log(limit)
 
 
 @app.post("/api/activity/{activity_id}/approve")
-def approve_activity(activity_id: int):
-    database.approve_activity(activity_id)
+async def approve_activity(activity_id: str):
+    await database.approve_activity(activity_id)
     return {"status": "approved", "id": activity_id}
 
 
 @app.post("/api/activity/{activity_id}/dismiss")
-def dismiss_activity(activity_id: int):
-    database.dismiss_activity(activity_id)
+async def dismiss_activity(activity_id: str):
+    await database.dismiss_activity(activity_id)
     return {"status": "dismissed", "id": activity_id}
 
 
@@ -272,7 +274,7 @@ async def read_frame(req: FrameRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    mode = database.get_current_mode()
+    mode = await database.get_current_mode()
     try:
         parsed, raw_text = await analyze_frame(image_bytes, mode)
     except Exception as e:
@@ -294,7 +296,7 @@ async def read_frame(req: FrameRequest):
         }
 
     # Count mode
-    items_result = _process_count_items(parsed if isinstance(parsed, list) else [])
+    items_result = await _process_count_items(parsed if isinstance(parsed, list) else [])
     return {
         "mode": "count",
         "items": items_result,
@@ -323,7 +325,7 @@ async def stream_endpoint(websocket: WebSocket):
                     data = data.split(",", 1)[1]
 
                 image_bytes = base64.b64decode(data)
-                mode = database.get_current_mode()
+                mode = await database.get_current_mode()
 
                 if mode in ("receive", "load"):
                     # QR decode only — no VLM
@@ -335,7 +337,7 @@ async def stream_endpoint(websocket: WebSocket):
                 else:
                     # Count mode — use VLM
                     parsed, raw_text = await analyze_frame(image_bytes, mode)
-                    items_result = _process_count_items(
+                    items_result = await _process_count_items(
                         parsed if isinstance(parsed, list) else []
                     )
                     await websocket.send_json({
@@ -354,12 +356,8 @@ async def stream_endpoint(websocket: WebSocket):
 # ---------- Helpers ----------
 
 
-def _process_count_items(raw_items: list[dict]) -> list[dict]:
-    """Store each counted item via upsert and return results.
-
-    Uses shelf_label_text as the dedup key so the same price tag
-    seen across multiple frames is updated rather than duplicated.
-    """
+async def _process_count_items(raw_items: list[dict]) -> list[dict]:
+    """Store each counted item via upsert and return results."""
     results = []
 
     for item in raw_items:
@@ -376,7 +374,7 @@ def _process_count_items(raw_items: list[dict]) -> list[dict]:
         price = item.get("price")
         shelf_position = item.get("shelf_position", "")
 
-        item_id, was_updated = database.upsert_item(
+        item_id, was_updated = await database.upsert_item(
             shelf_label_text=shelf_label,
             product_name=product_name,
             facing_count=facing_count,
@@ -385,8 +383,7 @@ def _process_count_items(raw_items: list[dict]) -> list[dict]:
             shelf_position=shelf_position,
         )
 
-        # Fetch the stored item to get the depth (may be from shelf_depths lookup)
-        stored = database.get_item(item_id)
+        stored = await database.get_item(item_id)
         depth = stored["depth"] if stored else 1
 
         results.append({
@@ -402,7 +399,7 @@ def _process_count_items(raw_items: list[dict]) -> list[dict]:
         })
 
     if results:
-        database.log_activity(
+        await database.log_activity(
             "items_counted",
             json.dumps({"item_count": len(results)}),
         )
@@ -415,7 +412,6 @@ def _process_count_items(raw_items: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 if os.path.isdir(FRONTEND_DIR):
-    # Serve known sub-pages as HTML
     @app.get("/inventory")
     async def _inventory_page():
         return FileResponse(os.path.join(FRONTEND_DIR, "inventory.html"))
@@ -424,15 +420,11 @@ if os.path.isdir(FRONTEND_DIR):
     async def _stream_page():
         return FileResponse(os.path.join(FRONTEND_DIR, "stream.html"))
 
-    # Serve static assets (_next/*, etc.)
     app.mount("/_next", StaticFiles(directory=os.path.join(FRONTEND_DIR, "_next")), name="frontend_next")
 
-    # Catch-all: serve index.html for the root and any unknown paths (SPA fallback)
     @app.get("/{full_path:path}")
     async def _spa_fallback(request: Request, full_path: str):
-        # Try exact file first
         file_path = os.path.join(FRONTEND_DIR, full_path)
         if os.path.isfile(file_path):
             return FileResponse(file_path)
-        # Fallback to index.html
         return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))

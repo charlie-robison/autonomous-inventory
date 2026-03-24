@@ -34,7 +34,7 @@ LOAD_PROMPT = """You are analyzing an image from a warehouse loading dock.
 Your tasks:
 1. Determine whether any QR codes are visible (do NOT decode — just detect)
 2. Identify any vehicle/truck numbers, license plates, fleet identifiers, or
-   truck IDs visible in the image
+   truck IDs visible in the image. Truck numbers follow the letters "GVW". 
 
 Return ONLY valid JSON, no markdown, no extra text:
 {"qr_detected": true/false, "vehicle_numbers": [{"number": "<vehicle number>"}]}
