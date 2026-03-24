@@ -1,34 +1,22 @@
+import base64
+import json
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
 
-from fastapi import FastAPI, Request, UploadFile
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.database import (
-    add_or_increment_item,
-    close_db,
-    connect_db,
-    create_pallet,
-    create_vehicle,
-    create_warehouse,
-    get_all_pallets,
-    get_all_vehicles,
-    get_all_warehouses,
-    get_inventory_collection,
-    get_item_observations,
-    get_pallet,
-)
-from app.load_pipeline import load_pallet
-from app.mode_selection import get_current_mode, select_mode
-from app.processing import process_frame
-from app.receive_pipeline import receive_pallet
-from app.stream_consumer import stream_consumer
+from . import database
+from .gemini_service import analyze_frame
+from .qr_service import decode_qr
 from app.audio_router import router as audio_router
 from app.stream_router import router as stream_router
+
+load_dotenv()
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
 FRONTEND_DIR = os.path.join(
@@ -38,10 +26,8 @@ FRONTEND_DIR = os.path.join(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_db()
+    database.init_db()
     yield
-    await stream_consumer.stop()
-    await close_db()
 
 
 app = FastAPI(title="Autonomous Inventory API", lifespan=lifespan)
@@ -59,22 +45,7 @@ app.include_router(stream_router)
 app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 
-class Item(BaseModel):
-    id: Optional[int] = None
-    name: str
-    description: str = ""
-    quantity: int = 0
-
-
-class InventoryUpdate(BaseModel):
-    name: str
-    count: int = 1
-    confidence_level: Optional[int] = None
-    explanation: Optional[str] = None
-
-
-# In-memory placeholder list
-items: list[Item] = []
+# ---------- Health ----------
 
 
 @app.get("/")
@@ -89,162 +60,354 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.get("/api/items")
-def get_items():
-    return items
+# ---------- App Mode ----------
 
-
-@app.post("/api/items")
-def create_item(item: Item):
-    items.append(item)
-    return item
-
-
-@app.post("/api/inventory")
-async def update_inventory(update: InventoryUpdate):
-    """Add a new item to inventory count or increment an existing item's count."""
-    result = await add_or_increment_item(
-        update.name, update.count, update.confidence_level, update.explanation,
-    )
-    return result
-
-
-@app.get("/api/inventory")
-async def get_inventory():
-    """Get all inventory counts."""
-    collection = get_inventory_collection()
-    cursor = collection.find({}, {"_id": 0, "name": 1, "count": 1, "confidence_level": 1, "explanation": 1})
-    return await cursor.to_list(length=None)
-
-
-@app.get("/api/inventory/{name}/observations")
-async def get_observations(name: str):
-    """Get the observation history for an item, including past explanations and image references."""
-    observations = await get_item_observations(name)
-    return {"name": name, "observations": observations}
-
-
-@app.post("/api/inventory/frame")
-async def process_single_frame(file: UploadFile):
-    """Accept a single image frame, run it through the VLM, and update inventory counts."""
-    image_bytes = await file.read()
-    results = await process_frame(image_bytes)
-    return {"items_updated": results}
-
-
-# ---------------------------------------------------------------------------
-# Mode selection
-# ---------------------------------------------------------------------------
 
 class ModeRequest(BaseModel):
-    text: str
-
-
-@app.post("/api/mode/select")
-async def api_select_mode(req: ModeRequest):
-    """Parse a mode from transcribed speech and set it as the current session mode."""
-    return await select_mode(req.text)
+    mode: str
 
 
 @app.get("/api/mode")
-async def api_get_mode():
-    """Return the current session mode."""
-    mode = await get_current_mode()
-    return {"current_mode": mode}
+def get_mode():
+    return {"mode": database.get_current_mode()}
 
 
-# ---------------------------------------------------------------------------
-# Vehicles
-# ---------------------------------------------------------------------------
-
-class VehicleCreate(BaseModel):
-    name: str
-
-
-@app.post("/api/vehicles")
-async def api_create_vehicle(body: VehicleCreate):
-    return await create_vehicle(body.name)
+@app.post("/api/mode")
+def set_mode(req: ModeRequest):
+    result = database.set_current_mode(req.mode)
+    if not result:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode. Must be one of: {', '.join(database.VALID_MODES)}",
+        )
+    return {"mode": result}
 
 
-@app.get("/api/vehicles")
-async def api_get_vehicles():
-    return await get_all_vehicles()
-
-
-# ---------------------------------------------------------------------------
-# Warehouses
-# ---------------------------------------------------------------------------
-
-class WarehouseCreate(BaseModel):
-    name: str
-
-
-@app.post("/api/warehouses")
-async def api_create_warehouse(body: WarehouseCreate):
-    return await create_warehouse(body.name)
+# ---------- Warehouses ----------
 
 
 @app.get("/api/warehouses")
-async def api_get_warehouses():
-    return await get_all_warehouses()
+def get_warehouses():
+    return database.get_warehouses()
 
 
-# ---------------------------------------------------------------------------
-# Pallets
-# ---------------------------------------------------------------------------
-
-class PalletCreate(BaseModel):
-    name: str
-    status: str = "on_port"
-    warehouse_fk: Optional[str] = None
-    vehicle_fk: Optional[str] = None
+# ---------- Vehicles ----------
 
 
-class ReceivePalletRequest(BaseModel):
-    pallet_id: str  # pallet name from QR code (e.g. "H123")
+@app.get("/api/vehicles")
+def get_vehicles():
+    return database.get_vehicles()
+
+
+# ---------- Pallets ----------
+
+
+class ReceiveRequest(BaseModel):
     lat: float
-    lon: float
+    lng: float
 
 
-class LoadPalletRequest(BaseModel):
-    pallet_id: str  # pallet name from QR code (e.g. "H123")
+class LoadRequest(BaseModel):
     vehicle_name: str
 
 
-@app.post("/api/pallets")
-async def api_create_pallet(body: PalletCreate):
-    return await create_pallet(name=body.name, status=body.status, warehouse_fk=body.warehouse_fk, vehicle_fk=body.vehicle_fk)
-
-
 @app.get("/api/pallets")
-async def api_get_pallets():
-    return await get_all_pallets()
+def get_pallets(status: str | None = None):
+    return database.get_pallets(status)
 
 
 @app.get("/api/pallets/{pallet_id}")
-async def api_get_pallet(pallet_id: str):
-    pallet = await get_pallet(pallet_id)
-    if pallet is None:
-        return {"error": "Pallet not found"}
+def get_pallet(pallet_id: str):
+    pallet = database.get_pallet(pallet_id)
+    if not pallet:
+        raise HTTPException(status_code=404, detail="Pallet not found")
     return pallet
 
 
-@app.post("/api/pallets/receive")
-async def api_receive_pallet(body: ReceivePalletRequest):
-    """Receive pipeline: mark a pallet as received at a warehouse based on geo coordinates."""
-    try:
-        return await receive_pallet(body.pallet_id, body.lat, body.lon)
-    except ValueError as e:
-        return {"error": str(e)}
+@app.post("/api/pallets/{pallet_id}/receive")
+def receive_pallet(pallet_id: str, req: ReceiveRequest):
+    """Set pallet to received. Uses geo coordinates to find nearest warehouse."""
+    from datetime import datetime, timezone
+
+    warehouse = database.get_nearest_warehouse(req.lat, req.lng)
+    if not warehouse:
+        raise HTTPException(status_code=400, detail="No warehouses configured")
+
+    database.receive_pallet(pallet_id, warehouse["id"])
+    database.log_activity(
+        "pallet_received",
+        json.dumps({
+            "pallet_id": pallet_id,
+            "warehouse": warehouse["name"],
+            "lat": req.lat,
+            "lng": req.lng,
+        }),
+    )
+
+    return {
+        "pallet_id": pallet_id,
+        "action": "receive",
+        "status": "received",
+        "warehouse_fk": f"WH-{warehouse['name'].upper().replace(' ', '-')}-{warehouse['id']:03d}",
+        "vehicle_fk": None,
+        "geo": {"lat": req.lat, "lng": req.lng},
+        "island": warehouse["name"],
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
-@app.post("/api/pallets/load")
-async def api_load_pallet(body: LoadPalletRequest):
-    """Load pipeline: mark a pallet as loaded onto a vehicle/truck."""
+@app.post("/api/pallets/{pallet_id}/load")
+def load_pallet(pallet_id: str, req: LoadRequest):
+    """Set pallet to loaded. Looks up or creates the vehicle."""
+    from datetime import datetime, timezone
+
+    vehicle = database.get_or_create_vehicle(req.vehicle_name)
+    database.load_pallet(pallet_id, vehicle["id"])
+    database.log_activity(
+        "pallet_loaded",
+        json.dumps({
+            "pallet_id": pallet_id,
+            "vehicle": vehicle["name"],
+            "vehicle_id": vehicle["id"],
+        }),
+    )
+
+    return {
+        "pallet_id": pallet_id,
+        "action": "load",
+        "status": "loaded",
+        "warehouse_fk": None,
+        "vehicle_fk": f"VH-{vehicle['id']:04d}",
+        "vehicle_num": vehicle["name"],
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+# ---------- Items ----------
+
+
+class DepthRequest(BaseModel):
+    depth: int
+
+
+@app.get("/api/items")
+def get_items():
+    return database.get_items()
+
+
+@app.post("/api/items/{item_id}/depth")
+def set_item_depth(item_id: int, req: DepthRequest):
+    if req.depth < 1:
+        raise HTTPException(status_code=400, detail="Depth must be at least 1")
+    result = database.set_item_depth(item_id, req.depth)
+    if not result:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return result
+
+
+# ---------- Shelf Depths ----------
+
+
+class ShelfDepthRequest(BaseModel):
+    product_name: str
+    depth: int
+
+
+@app.get("/api/shelf-depths")
+def get_shelf_depths():
+    return database.get_shelf_depths()
+
+
+@app.post("/api/shelf-depths")
+def set_shelf_depth(req: ShelfDepthRequest):
+    if req.depth < 1:
+        raise HTTPException(status_code=400, detail="Depth must be at least 1")
+    return database.set_shelf_depth(req.product_name, req.depth)
+
+
+# ---------- Activity Log ----------
+
+
+@app.get("/api/activity")
+def get_activity(limit: int = 50):
+    return database.get_activity_log(limit)
+
+
+@app.post("/api/activity/{activity_id}/approve")
+def approve_activity(activity_id: int):
+    database.approve_activity(activity_id)
+    return {"status": "approved", "id": activity_id}
+
+
+@app.post("/api/activity/{activity_id}/dismiss")
+def dismiss_activity(activity_id: int):
+    database.dismiss_activity(activity_id)
+    return {"status": "dismissed", "id": activity_id}
+
+
+# ---------- Frame Analysis ----------
+
+
+class FrameRequest(BaseModel):
+    image: str  # base64-encoded JPEG
+
+
+@app.post("/api/scan-qr")
+def scan_qr(req: FrameRequest):
+    """Decode QR codes from a frame using qreader. No VLM involved."""
     try:
-        return await load_pallet(body.pallet_id, body.vehicle_name)
-    except ValueError as e:
-        return {"error": str(e)}
+        image_bytes = base64.b64decode(req.image)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data")
+
+    qr_codes = decode_qr(image_bytes)
+    return {"qr_codes": qr_codes}
+
+
+@app.post("/api/read")
+async def read_frame(req: FrameRequest):
+    """Process a single frame with VLM (count mode or load vehicle detection)."""
+    try:
+        image_bytes = base64.b64decode(req.image)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data")
+
+    mode = database.get_current_mode()
+    try:
+        parsed, raw_text = await analyze_frame(image_bytes, mode)
+    except Exception as e:
+        raw_text = f"Gemini error: {e}"
+        if mode == "load":
+            parsed = {"vehicle_numbers": []}
+        else:
+            parsed = []
+
+    if mode == "load":
+        if isinstance(parsed, dict):
+            vehicle_numbers = parsed.get("vehicle_numbers", [])
+        else:
+            vehicle_numbers = []
+        return {
+            "mode": "load",
+            "vehicle_numbers": vehicle_numbers,
+            "raw_response": raw_text,
+        }
+
+    # Count mode
+    items_result = _process_count_items(parsed if isinstance(parsed, list) else [])
+    return {
+        "mode": "count",
+        "items": items_result,
+        "raw_response": raw_text,
+    }
+
+
+# ---------- WebSocket Stream ----------
+
+
+@app.websocket("/ws/stream")
+async def stream_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    busy = False
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+
+            if busy:
+                continue
+
+            busy = True
+            try:
+                if "," in data:
+                    data = data.split(",", 1)[1]
+
+                image_bytes = base64.b64decode(data)
+                mode = database.get_current_mode()
+
+                if mode in ("receive", "load"):
+                    # QR decode only — no VLM
+                    qr_codes = decode_qr(image_bytes)
+                    await websocket.send_json({
+                        "mode": mode,
+                        "qr_codes": qr_codes,
+                    })
+                else:
+                    # Count mode — use VLM
+                    parsed, raw_text = await analyze_frame(image_bytes, mode)
+                    items_result = _process_count_items(
+                        parsed if isinstance(parsed, list) else []
+                    )
+                    await websocket.send_json({
+                        "mode": "count",
+                        "items": items_result,
+                        "raw_response": raw_text,
+                    })
+            except Exception as e:
+                await websocket.send_json({"error": str(e)})
+            finally:
+                busy = False
+    except WebSocketDisconnect:
+        pass
+
+
+# ---------- Helpers ----------
+
+
+def _process_count_items(raw_items: list[dict]) -> list[dict]:
+    """Store each counted item via upsert and return results.
+
+    Uses shelf_label_text as the dedup key so the same price tag
+    seen across multiple frames is updated rather than duplicated.
+    """
+    results = []
+
+    for item in raw_items:
+        shelf_label = item.get("shelf_label_text", "")
+        if not shelf_label:
+            continue
+
+        confidence = item.get("confidence", 0.0)
+        if confidence < 0.3:
+            continue
+
+        facing_count = item.get("facing_count", 0)
+        product_name = item.get("product_name", shelf_label)
+        price = item.get("price")
+        shelf_position = item.get("shelf_position", "")
+
+        item_id, was_updated = database.upsert_item(
+            shelf_label_text=shelf_label,
+            product_name=product_name,
+            facing_count=facing_count,
+            price=price,
+            confidence=confidence,
+            shelf_position=shelf_position,
+        )
+
+        # Fetch the stored item to get the depth (may be from shelf_depths lookup)
+        stored = database.get_item(item_id)
+        depth = stored["depth"] if stored else 1
+
+        results.append({
+            "id": item_id,
+            "shelf_label_text": shelf_label,
+            "product_name": product_name,
+            "facing_count": facing_count,
+            "depth": depth,
+            "price": price,
+            "confidence": confidence,
+            "shelf_position": shelf_position,
+            "updated": was_updated,
+        })
+
+    if results:
+        database.log_activity(
+            "items_counted",
+            json.dumps({"item_count": len(results)}),
+        )
+
+    return results
 
 
 # ---------------------------------------------------------------------------

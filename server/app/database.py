@@ -1,294 +1,454 @@
-import os
-from datetime import datetime, timezone
+import json
+import sqlite3
+from pathlib import Path
 
-from bson import ObjectId
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
+DATABASE_PATH = Path(__file__).parent.parent / "inventory.db"
+SHELF_DEPTHS_PATH = Path(__file__).parent.parent / "shelf_depths.json"
 
-load_dotenv()
-
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "autonomous_inventory")
-
-client: AsyncIOMotorClient = None
-db = None
-
-
-async def connect_db():
-    global client, db
-    client = AsyncIOMotorClient(MONGODB_URI)
-    db = client[MONGODB_DB_NAME]
-
-
-async def close_db():
-    global client
-    if client:
-        client.close()
-
-
-# ---------------------------------------------------------------------------
-# Collection accessors
-# ---------------------------------------------------------------------------
-
-def get_inventory_collection():
-    return db["inventory"]
-
-
-def get_vehicles_collection():
-    return db["vehicles"]
-
-
-def get_warehouses_collection():
-    return db["warehouses"]
-
-
-def get_pallets_collection():
-    return db["pallets"]
-
-
-def get_app_mode_collection():
-    return db["app_mode"]
-
-
-# ---------------------------------------------------------------------------
-# Inventory (existing)
-# ---------------------------------------------------------------------------
-
-async def add_or_increment_item(
-    name: str,
-    count: int = 1,
-    confidence_level: int | None = None,
-    explanation: str | None = None,
-    image_path: str | None = None,
-) -> dict:
-    """Add a new item to inventory or increment its count if it already exists.
-
-    Uses MongoDB upsert with $inc to atomically insert or increment.
-    Latest confidence/explanation are kept at top level via $set.
-    Each observation is appended to the observations array via $push.
-    """
-    collection = get_inventory_collection()
-    update: dict = {"$inc": {"count": count}}
-
-    # Always keep the latest confidence/explanation at top level
-    set_fields = {}
-    if confidence_level is not None:
-        set_fields["confidence_level"] = confidence_level
-    if explanation is not None:
-        set_fields["explanation"] = explanation
-    if set_fields:
-        update["$set"] = set_fields
-
-    # Build observation record and push to history
-    observation = {"timestamp": datetime.now(timezone.utc), "count": count}
-    if confidence_level is not None:
-        observation["confidence_level"] = confidence_level
-    if explanation is not None:
-        observation["explanation"] = explanation
-    if image_path is not None:
-        observation["image_path"] = image_path
-    update["$push"] = {"observations": observation}
-
-    result = await collection.find_one_and_update(
-        {"name": name},
-        update,
-        upsert=True,
-        return_document=True,
-    )
-    return {
-        "name": result["name"],
-        "count": result["count"],
-        "confidence_level": result.get("confidence_level"),
-        "explanation": result.get("explanation"),
-    }
-
-
-async def get_item_observations(name: str) -> list[dict]:
-    """Return the observation history for a given item."""
-    collection = get_inventory_collection()
-    doc = await collection.find_one({"name": name}, {"_id": 0, "observations": 1})
-    if not doc:
-        return []
-    return doc.get("observations", [])
-
-
-# ---------------------------------------------------------------------------
-# App Mode  (singleton document — only one mode active at a time)
-# ---------------------------------------------------------------------------
-
+VALID_PALLET_STATUSES = ("on_boat", "at_port", "received", "loaded")
 VALID_MODES = ("count", "receive", "load")
 
+# Hawaiian island warehouse coordinates for geo lookup
+WAREHOUSE_COORDS = {
+    "Oahu": (21.4389, -158.0001),
+    "Maui": (20.7984, -156.3319),
+    "Big Island": (19.7241, -155.4315),
+    "Kauai": (22.0964, -159.5261),
+    "Molokai": (21.1333, -157.0167),
+    "Lanai": (20.8333, -156.9167),
+}
 
-async def set_app_mode(mode: str) -> dict:
-    """Set the current application mode. Returns the updated mode document."""
-    mode = mode.lower()
+
+def get_db():
+    conn = sqlite3.connect(str(DATABASE_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS warehouses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS vehicles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pallets (
+            id TEXT PRIMARY KEY,
+            status TEXT DEFAULT 'on_boat'
+                CHECK(status IN ('on_boat', 'at_port', 'received', 'loaded')),
+            warehouse_fk INTEGER REFERENCES warehouses(id),
+            vehicle_fk INTEGER REFERENCES vehicles(id),
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shelf_label_text TEXT NOT NULL DEFAULT '',
+            product_name TEXT NOT NULL DEFAULT '',
+            facing_count INTEGER DEFAULT 0,
+            depth INTEGER DEFAULT 1,
+            price REAL,
+            confidence REAL DEFAULT 0.0,
+            shelf_position TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS current_app_mode (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            current_mode TEXT DEFAULT 'receive'
+                CHECK(current_mode IN ('count', 'receive', 'load'))
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            details TEXT DEFAULT '',
+            approved INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS shelf_depths (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_name TEXT NOT NULL UNIQUE,
+            depth INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+
+    # Seed Hawaiian island warehouses
+    for name in WAREHOUSE_COORDS:
+        c.execute("INSERT OR IGNORE INTO warehouses (name) VALUES (?)", (name,))
+
+    # Seed default mode
+    c.execute(
+        "INSERT OR IGNORE INTO current_app_mode (id, current_mode) VALUES (1, 'receive')"
+    )
+
+    # Seed shelf depths from JSON file
+    if SHELF_DEPTHS_PATH.exists():
+        shelf_data = json.loads(SHELF_DEPTHS_PATH.read_text())
+        for entry in shelf_data:
+            c.execute(
+                "INSERT OR IGNORE INTO shelf_depths (product_name, depth) VALUES (?, ?)",
+                (entry["product_name"], entry["depth"]),
+            )
+
+    conn.commit()
+    conn.close()
+
+
+# ---------- App Mode ----------
+
+
+def get_current_mode() -> str:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT current_mode FROM current_app_mode WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    return row["current_mode"] if row else "receive"
+
+
+def set_current_mode(mode: str) -> str | None:
     if mode not in VALID_MODES:
-        raise ValueError(f"Invalid mode '{mode}'. Must be one of {VALID_MODES}")
-    collection = get_app_mode_collection()
-    result = await collection.find_one_and_update(
-        {},  # singleton — match any document
-        {"$set": {"current_mode": mode, "updated_at": datetime.now(timezone.utc)}},
-        upsert=True,
-        return_document=True,
+        return None
+    conn = get_db()
+    conn.execute(
+        "UPDATE current_app_mode SET current_mode = ? WHERE id = 1", (mode,)
     )
-    return {"current_mode": result["current_mode"], "updated_at": result["updated_at"]}
+    conn.commit()
+    conn.close()
+    return mode
 
 
-async def get_app_mode() -> str:
-    """Return the current application mode (defaults to 'count')."""
-    collection = get_app_mode_collection()
-    doc = await collection.find_one({}, {"_id": 0, "current_mode": 1})
-    if not doc:
-        return "count"
-    return doc.get("current_mode", "count")
+# ---------- Warehouses ----------
 
 
-# ---------------------------------------------------------------------------
-# Vehicles
-# ---------------------------------------------------------------------------
-
-async def create_vehicle(name: str) -> dict:
-    """Create a new vehicle. Returns the created document."""
-    collection = get_vehicles_collection()
-    doc = {"name": name, "created_at": datetime.now(timezone.utc)}
-    result = await collection.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return _serialize(doc)
+def get_warehouses() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM warehouses ORDER BY name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
-async def get_vehicle_by_id(vehicle_id: str) -> dict | None:
-    collection = get_vehicles_collection()
-    doc = await collection.find_one({"_id": ObjectId(vehicle_id)})
-    return _serialize(doc) if doc else None
+def get_nearest_warehouse(lat: float, lng: float) -> dict | None:
+    """Find the nearest Hawaiian island warehouse by coordinates."""
+    conn = get_db()
+    warehouses = conn.execute("SELECT * FROM warehouses").fetchall()
+    conn.close()
+
+    if not warehouses:
+        return None
+
+    best = None
+    best_dist = float("inf")
+    for wh in warehouses:
+        coords = WAREHOUSE_COORDS.get(wh["name"])
+        if not coords:
+            continue
+        dist = (lat - coords[0]) ** 2 + (lng - coords[1]) ** 2
+        if dist < best_dist:
+            best_dist = dist
+            best = dict(wh)
+
+    return best
 
 
-async def get_vehicle_by_name(name: str) -> dict | None:
-    """Case-insensitive lookup of a vehicle by name."""
-    collection = get_vehicles_collection()
-    doc = await collection.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
-    return _serialize(doc) if doc else None
+# ---------- Vehicles ----------
 
 
-async def get_all_vehicles() -> list[dict]:
-    collection = get_vehicles_collection()
-    cursor = collection.find({})
-    return [_serialize(doc) async for doc in cursor]
+def get_vehicles() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM vehicles ORDER BY name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Warehouses
-# ---------------------------------------------------------------------------
-
-async def create_warehouse(name: str) -> dict:
-    """Create a new warehouse. Returns the created document."""
-    collection = get_warehouses_collection()
-    doc = {"name": name, "created_at": datetime.now(timezone.utc)}
-    result = await collection.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return _serialize(doc)
-
-
-async def get_warehouse_by_id(warehouse_id: str) -> dict | None:
-    collection = get_warehouses_collection()
-    doc = await collection.find_one({"_id": ObjectId(warehouse_id)})
-    return _serialize(doc) if doc else None
+def get_or_create_vehicle(name: str) -> dict:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM vehicles WHERE name = ?", (name,)).fetchone()
+    if row:
+        conn.close()
+        return dict(row)
+    c = conn.execute("INSERT INTO vehicles (name) VALUES (?)", (name,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM vehicles WHERE id = ?", (c.lastrowid,)).fetchone()
+    conn.close()
+    return dict(row)
 
 
-async def get_warehouse_by_name(name: str) -> dict | None:
-    """Case-insensitive lookup of a warehouse by name."""
-    collection = get_warehouses_collection()
-    doc = await collection.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
-    return _serialize(doc) if doc else None
+# ---------- Pallets ----------
 
 
-async def get_all_warehouses() -> list[dict]:
-    collection = get_warehouses_collection()
-    cursor = collection.find({})
-    return [_serialize(doc) async for doc in cursor]
+def get_or_create_pallet(pallet_id: str) -> dict:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM pallets WHERE id = ?", (pallet_id,)).fetchone()
+    if row:
+        conn.close()
+        return dict(row)
+    conn.execute("INSERT INTO pallets (id) VALUES (?)", (pallet_id,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM pallets WHERE id = ?", (pallet_id,)).fetchone()
+    conn.close()
+    return dict(row)
 
 
-# ---------------------------------------------------------------------------
-# Pallets
-# ---------------------------------------------------------------------------
+def _pallet_with_joins(conn, pallet_id: str) -> dict | None:
+    row = conn.execute(
+        """SELECT p.*, w.name AS warehouse_name, v.name AS vehicle_name
+           FROM pallets p
+           LEFT JOIN warehouses w ON p.warehouse_fk = w.id
+           LEFT JOIN vehicles v ON p.vehicle_fk = v.id
+           WHERE p.id = ?""",
+        (pallet_id,),
+    ).fetchone()
+    return dict(row) if row else None
 
-VALID_PALLET_STATUSES = ("on_boat", "on_port", "received", "loaded")
+
+def receive_pallet(pallet_id: str, warehouse_id: int) -> dict:
+    """Set pallet to received, assign warehouse, clear vehicle."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO pallets (id, status, warehouse_fk, vehicle_fk) "
+        "VALUES (?, 'received', ?, NULL) "
+        "ON CONFLICT(id) DO UPDATE SET status='received', warehouse_fk=?, "
+        "vehicle_fk=NULL, updated_at=CURRENT_TIMESTAMP",
+        (pallet_id, warehouse_id, warehouse_id),
+    )
+    conn.commit()
+    result = _pallet_with_joins(conn, pallet_id)
+    conn.close()
+    return result or {}
 
 
-async def create_pallet(
-    name: str | None = None,
-    status: str = "on_port",
-    warehouse_fk: str | None = None,
-    vehicle_fk: str | None = None,
-) -> dict:
-    """Create a new pallet. Returns the created document with its id."""
+def load_pallet(pallet_id: str, vehicle_id: int) -> dict:
+    """Set pallet to loaded, assign vehicle, clear warehouse."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO pallets (id, status, warehouse_fk, vehicle_fk) "
+        "VALUES (?, 'loaded', NULL, ?) "
+        "ON CONFLICT(id) DO UPDATE SET status='loaded', warehouse_fk=NULL, "
+        "vehicle_fk=?, updated_at=CURRENT_TIMESTAMP",
+        (pallet_id, vehicle_id, vehicle_id),
+    )
+    conn.commit()
+    result = _pallet_with_joins(conn, pallet_id)
+    conn.close()
+    return result or {}
+
+
+def update_pallet_status(pallet_id: str, status: str) -> dict | None:
     if status not in VALID_PALLET_STATUSES:
-        raise ValueError(f"Invalid status '{status}'. Must be one of {VALID_PALLET_STATUSES}")
-    collection = get_pallets_collection()
-    doc = {
-        "name": name,
-        "status": status,
-        "warehouse_fk": warehouse_fk,
-        "vehicle_fk": vehicle_fk,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
-    }
-    result = await collection.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return _serialize(doc)
-
-
-async def get_pallet(pallet_id: str) -> dict | None:
-    """Look up a pallet by its _id."""
-    collection = get_pallets_collection()
-    try:
-        doc = await collection.find_one({"_id": ObjectId(pallet_id)})
-    except Exception:
         return None
-    return _serialize(doc) if doc else None
-
-
-async def get_pallet_by_name(name: str) -> dict | None:
-    """Case-insensitive lookup of a pallet by name."""
-    collection = get_pallets_collection()
-    doc = await collection.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
-    return _serialize(doc) if doc else None
-
-
-async def get_or_create_pallet(name: str) -> dict:
-    """Find a pallet by name, or create a new one with status 'on_port'."""
-    pallet = await get_pallet_by_name(name)
-    if pallet:
-        return pallet
-    return await create_pallet(name=name, status="on_port")
-
-
-async def update_pallet(pallet_id: str, updates: dict) -> dict | None:
-    """Apply arbitrary field updates to a pallet. Returns the updated document."""
-    collection = get_pallets_collection()
-    updates["updated_at"] = datetime.now(timezone.utc)
-    doc = await collection.find_one_and_update(
-        {"_id": ObjectId(pallet_id)},
-        {"$set": updates},
-        return_document=True,
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO pallets (id, status) VALUES (?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET status=?, updated_at=CURRENT_TIMESTAMP",
+        (pallet_id, status, status),
     )
-    return _serialize(doc) if doc else None
+    conn.commit()
+    result = _pallet_with_joins(conn, pallet_id)
+    conn.close()
+    return result
 
 
-async def get_all_pallets() -> list[dict]:
-    collection = get_pallets_collection()
-    cursor = collection.find({})
-    return [_serialize(doc) async for doc in cursor]
+def get_pallets(status: str | None = None) -> list[dict]:
+    conn = get_db()
+    query = """SELECT p.*, w.name AS warehouse_name, v.name AS vehicle_name
+               FROM pallets p
+               LEFT JOIN warehouses w ON p.warehouse_fk = w.id
+               LEFT JOIN vehicles v ON p.vehicle_fk = v.id"""
+    if status:
+        query += " WHERE p.status = ? ORDER BY p.updated_at DESC"
+        rows = conn.execute(query, (status,)).fetchall()
+    else:
+        query += " ORDER BY p.updated_at DESC"
+        rows = conn.execute(query).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def get_pallet(pallet_id: str) -> dict | None:
+    conn = get_db()
+    result = _pallet_with_joins(conn, pallet_id)
+    conn.close()
+    return result
 
-def _serialize(doc: dict) -> dict:
-    """Convert MongoDB document to JSON-safe dict (ObjectId -> str)."""
-    if doc is None:
-        return None
-    doc = dict(doc)
-    if "_id" in doc:
-        doc["id"] = str(doc.pop("_id"))
-    return doc
+
+# ---------- Items ----------
+
+
+def _lookup_shelf_depth(conn, product_name: str) -> int:
+    """Find the best matching depth from shelf_depths. Case-insensitive substring match."""
+    row = conn.execute(
+        "SELECT depth FROM shelf_depths WHERE LOWER(product_name) = LOWER(?)",
+        (product_name,),
+    ).fetchone()
+    if row:
+        return row["depth"]
+    # Try substring match — shelf_depths product_name contained in the detected name
+    rows = conn.execute("SELECT product_name, depth FROM shelf_depths").fetchall()
+    for r in rows:
+        if r["product_name"].lower() in product_name.lower():
+            return r["depth"]
+    return 1
+
+
+def upsert_item(
+    shelf_label_text: str,
+    product_name: str = "",
+    facing_count: int = 0,
+    price: float | None = None,
+    confidence: float = 0.0,
+    shelf_position: str = "",
+) -> tuple[int, bool]:
+    """Upsert an item keyed by shelf_label_text (the price tag text)."""
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id, confidence, depth FROM items WHERE shelf_label_text = ?",
+        (shelf_label_text,),
+    ).fetchone()
+
+    if existing:
+        # Only update facing_count/confidence, preserve user-set depth
+        if confidence >= existing["confidence"]:
+            conn.execute(
+                """UPDATE items SET product_name=?, facing_count=?, price=?,
+                   confidence=?, shelf_position=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (product_name, facing_count, price, confidence,
+                 shelf_position, existing["id"]),
+            )
+            conn.commit()
+        item_id = existing["id"]
+        conn.close()
+        return item_id, True
+
+    # New item — look up depth from shelf_depths table
+    depth = _lookup_shelf_depth(conn, product_name)
+
+    c = conn.execute(
+        "INSERT INTO items (shelf_label_text, product_name, facing_count, "
+        "depth, price, confidence, shelf_position) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (shelf_label_text, product_name, facing_count, depth, price,
+         confidence, shelf_position),
+    )
+    conn.commit()
+    item_id = c.lastrowid
+    conn.close()
+    return item_id, False
+
+
+def get_item(item_id: int) -> dict | None:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_items() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM items ORDER BY updated_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_item_depth(item_id: int, depth: int) -> dict | None:
+    """Set the depth (rows deep) for an item. Total = facing_count * depth."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE items SET depth=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (depth, item_id),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ---------- Shelf Depths ----------
+
+
+def get_shelf_depths() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM shelf_depths ORDER BY product_name"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_shelf_depth(product_name: str, depth: int) -> dict:
+    """Create or update a shelf depth entry."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO shelf_depths (product_name, depth) VALUES (?, ?) "
+        "ON CONFLICT(product_name) DO UPDATE SET depth=?",
+        (product_name, depth, depth),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM shelf_depths WHERE product_name = ?", (product_name,)
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+# ---------- Activity Log ----------
+
+
+def log_activity(action: str, details: str = "") -> int:
+    conn = get_db()
+    c = conn.execute(
+        "INSERT INTO activity_log (action, details) VALUES (?, ?)",
+        (action, details),
+    )
+    conn.commit()
+    log_id = c.lastrowid
+    conn.close()
+    return log_id
+
+
+def get_activity_log(limit: int = 50) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM activity_log ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def approve_activity(activity_id: int) -> None:
+    conn = get_db()
+    conn.execute("UPDATE activity_log SET approved = 1 WHERE id = ?", (activity_id,))
+    conn.commit()
+    conn.close()
+
+
+def dismiss_activity(activity_id: int) -> None:
+    conn = get_db()
+    conn.execute("UPDATE activity_log SET approved = -1 WHERE id = ?", (activity_id,))
+    conn.commit()
+    conn.close()
