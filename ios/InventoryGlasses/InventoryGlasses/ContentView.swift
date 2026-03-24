@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 struct ContentView: View {
     @StateObject private var glasses = GlassesSession()
@@ -29,6 +30,15 @@ struct ContentView: View {
                         .aspectRatio(contentMode: .fit)
                         .frame(maxHeight: 300)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay(alignment: .topTrailing) {
+                            Text(glasses.source == .glasses ? "Glasses" : "Camera")
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Capsule())
+                                .padding(8)
+                        }
                         .padding(.horizontal)
                 } else {
                     RoundedRectangle(cornerRadius: 12)
@@ -39,7 +49,9 @@ struct ContentView: View {
                                 Image(systemName: "eyeglasses")
                                     .font(.system(size: 40))
                                     .foregroundStyle(.secondary)
-                                Text("No video feed")
+                                Text(glasses.statusMessage.isEmpty
+                                     ? (glasses.isConnected ? "Starting..." : "No video feed")
+                                     : glasses.statusMessage)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -50,7 +62,7 @@ struct ContentView: View {
                 // Status indicators
                 HStack(spacing: 24) {
                     StatusBadge(
-                        label: "Glasses",
+                        label: glasses.source == .glasses ? "Glasses" : "Camera",
                         connected: glasses.isConnected
                     )
                     StatusBadge(
@@ -66,7 +78,27 @@ struct ContentView: View {
                     }
                 }
 
-                // Connect / Stop button
+                // Registration button (only show if not registered and not on simulator)
+                #if !targetEnvironment(simulator)
+                if !glasses.isRegistered {
+                    Button {
+                        glasses.register()
+                    } label: {
+                        HStack {
+                            Image(systemName: "link.badge.plus")
+                            Text("Connect Meta Glasses")
+                        }
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .padding(.horizontal)
+                }
+                #endif
+
+                // Start/Stop upload button
                 Button {
                     if isStreaming {
                         stopStreaming()
@@ -74,7 +106,7 @@ struct ContentView: View {
                         startStreaming()
                     }
                 } label: {
-                    Text(isStreaming ? "Stop" : "Connect")
+                    Text(isStreaming ? "Stop Uploading" : "Start Uploading")
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
@@ -96,6 +128,9 @@ struct ContentView: View {
             }
             .padding(.top)
             .navigationTitle("Inventory Glasses")
+            .onAppear {
+                glasses.start()
+            }
             .onChange(of: glasses.latestImage) { _, newImage in
                 guard isStreaming, let image = newImage else { return }
                 uploader.sendFrame(image)
@@ -105,12 +140,13 @@ struct ContentView: View {
 
     private func startStreaming() {
         uploader.connect(serverIP: serverIP)
-        glasses.start()
+        if !glasses.isConnected {
+            glasses.start()
+        }
         isStreaming = true
     }
 
     private func stopStreaming() {
-        glasses.stop()
         uploader.disconnect()
         isStreaming = false
     }

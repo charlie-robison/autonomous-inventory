@@ -5,12 +5,22 @@ options:
     iOS: "17.0"
   xcodeVersion: "15.4"
 
+packages:
+  MetaWearablesDAT:
+    url: https://github.com/facebook/meta-wearables-dat-ios
+    from: "0.5.0"
+
 targets:
   InventoryGlasses:
     type: application
     platform: iOS
     sources:
       - InventoryGlasses
+    dependencies:
+      - package: MetaWearablesDAT
+        product: MWDATCore
+      - package: MetaWearablesDAT
+        product: MWDATCamera
     settings:
       base:
         INFOPLIST_FILE: InventoryGlasses/Info.plist
