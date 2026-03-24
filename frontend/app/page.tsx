@@ -9,6 +9,21 @@ interface ScanResult {
 }
 
 type ViewState = "idle" | "recording" | "processing" | "results";
+type AppMode = "count" | "receive" | "load";
+
+const API_BASE = "http://localhost:8000";
+
+const MODE_COLORS: Record<AppMode, string> = {
+  count: "bg-emerald-500/20 border-emerald-500/30 text-emerald-300",
+  receive: "bg-blue-500/20 border-blue-500/30 text-blue-300",
+  load: "bg-amber-500/20 border-amber-500/30 text-amber-300",
+};
+
+const MODE_DOT_COLORS: Record<AppMode, string> = {
+  count: "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]",
+  receive: "bg-blue-400 shadow-[0_0_8px_rgba(96,165,250,0.6)]",
+  load: "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]",
+};
 
 const MOCK_RESULTS: ScanResult[] = [
   { name: "Cardboard Box (Small)", count: 12 },
@@ -30,6 +45,32 @@ export default function Home() {
   const [viewState, setViewState] = useState<ViewState>("idle");
   const [elapsed, setElapsed] = useState(0);
   const [results, setResults] = useState<ScanResult[]>([]);
+
+  // Mode state
+  const [appMode, setAppMode] = useState<AppMode>("count");
+  const [isListening, setIsListening] = useState(false);
+  const [modeStatus, setModeStatus] = useState<string>("");
+  const listeningRef = useRef(false);
+  const micStreamRef = useRef<MediaStream | null>(null);
+
+  // Poll current mode from backend
+  useEffect(() => {
+    const fetchMode = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/mode`);
+        if (res.ok) {
+          const data = await res.json();
+          setAppMode(data.current_mode as AppMode);
+        }
+      } catch {
+        // Backend may not be running yet
+      }
+    };
+
+    fetchMode();
+    const interval = setInterval(fetchMode, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const startCamera = useCallback(async () => {
     try {
@@ -58,6 +99,153 @@ export default function Home() {
       if (timerRef.current) clearInterval(timerRef.current);
     };
   }, [startCamera]);
+
+  // Always-on voice listening for mode selection.
+  // Starts automatically on mount, records in 2-second segments,
+  // and changes mode whenever a keyword is heard.
+  const startListening = useCallback(async () => {
+    if (listeningRef.current) return;
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setModeStatus("Microphone access denied");
+      return;
+    }
+
+    micStreamRef.current = stream;
+    listeningRef.current = true;
+    setIsListening(true);
+    setModeStatus("Say 'Jarvis' + mode...");
+
+    // Loop forever: record 2s segments and check for mode keywords
+    while (listeningRef.current) {
+      const text = await recordAndTranscribe(stream);
+
+      if (!listeningRef.current) break;
+      if (!text || !text.trim()) continue;
+
+      const modeMatch = detectMode(text);
+      if (modeMatch) {
+        setModeStatus(`Heard "${text}" — setting ${modeMatch}...`);
+
+        try {
+          const res = await fetch(`${API_BASE}/api/mode/select`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.matched) {
+              setAppMode(data.mode as AppMode);
+              setModeStatus(`Mode: ${data.mode}`);
+            }
+          }
+        } catch {
+          setModeStatus("Failed to set mode");
+        }
+
+        // Brief pause after setting mode so the status is visible,
+        // then resume listening for the next command
+        await new Promise((r) => setTimeout(r, 1500));
+        if (listeningRef.current) setModeStatus("Say 'Jarvis' + mode...");
+      }
+    }
+
+    // Cleanup (only if explicitly stopped)
+    stream.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
+    setIsListening(false);
+  }, []);
+
+  // Auto-start listening on mount
+  useEffect(() => {
+    startListening();
+    return () => {
+      listeningRef.current = false;
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    };
+  }, [startListening]);
+
+  /** Record a ~2s audio segment from the stream and return transcribed text. */
+  const recordAndTranscribe = (stream: MediaStream): Promise<string> => {
+    return new Promise((resolve) => {
+      const chunks: Blob[] = [];
+      const recorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : "audio/webm",
+      });
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        if (!chunks.length) { resolve(""); return; }
+
+        try {
+          const blob = new Blob(chunks, { type: "audio/webm" });
+          const arrayBuffer = await blob.arrayBuffer();
+          const audioCtx = new AudioContext({ sampleRate: 16000 });
+          const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+          const pcmFloat = decoded.getChannelData(0);
+
+          // Normalize quiet audio: boost so peak reaches ~90% of max
+          const peak = pcmFloat.reduce((mx, v) => Math.max(mx, Math.abs(v)), 0);
+          const gain = peak > 0 && peak < 0.25 ? 0.9 / peak : 1;
+
+          // Float32 -> Int16 with gain applied
+          const pcm16 = new Int16Array(pcmFloat.length);
+          for (let i = 0; i < pcmFloat.length; i++) {
+            const s = Math.max(-1, Math.min(1, pcmFloat[i] * gain));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+
+          // Transcribe via WebSocket
+          const text = await transcribeViaWs(pcm16);
+          audioCtx.close();
+          resolve(text);
+        } catch {
+          resolve("");
+        }
+      };
+
+      recorder.start();
+      setTimeout(() => {
+        if (recorder.state === "recording") recorder.stop();
+      }, 2000);
+    });
+  };
+
+  /** Send PCM to the audio WebSocket and get transcription back. */
+  const transcribeViaWs = (pcm16: Int16Array): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://localhost:8000/ws/audio-stream`);
+      const timeout = setTimeout(() => { ws.close(); resolve(""); }, 10000);
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "status" && msg.message === "ready") {
+          ws.send(pcm16.buffer);
+          ws.send(JSON.stringify({ action: "transcribe" }));
+        } else if (msg.type === "transcription") {
+          clearTimeout(timeout);
+          ws.close();
+          resolve(msg.text || "");
+        } else if (msg.type === "error") {
+          clearTimeout(timeout);
+          ws.close();
+          resolve("");
+        }
+      };
+
+      ws.onerror = () => { clearTimeout(timeout); resolve(""); };
+    });
+  };
 
   const startRecording = () => {
     if (!streamRef.current) return;
@@ -309,28 +497,51 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Nav links (hidden while recording) */}
+        {/* Mode indicator + nav links */}
         {viewState === "idle" && (
-          <div className="absolute top-4 right-4 z-30 flex gap-2">
-            <Link
-              href="/stream"
-              className="h-9 px-3.5 flex items-center gap-1.5 rounded-full bg-white/[0.08] backdrop-blur-xl border border-white/[0.12] text-white/70 text-[13px] font-medium transition-colors active:bg-white/[0.15]"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3v11.25A2.25 2.25 0 0 0 6 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0 1 18 16.5h-2.25m-7.5 0h7.5m-7.5 0-1 3m8.5-3 1 3m0 0 .5 1.5m-.5-1.5h-9.5m0 0-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6" />
-              </svg>
-              Live
-            </Link>
-            <Link
-              href="/inventory"
-              className="h-9 px-3.5 flex items-center gap-1.5 rounded-full bg-white/[0.08] backdrop-blur-xl border border-white/[0.12] text-white/70 text-[13px] font-medium transition-colors active:bg-white/[0.15]"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 0 1 0 3.75H5.625a1.875 1.875 0 0 1 0-3.75Z" />
-              </svg>
-              Items
-            </Link>
-          </div>
+          <>
+            {/* Mode badge + mic indicator — top left */}
+            <div className="absolute top-4 left-4 z-30">
+              <div className={`flex items-center gap-2 rounded-full px-3.5 py-2 border backdrop-blur-xl ${MODE_COLORS[appMode]}`}>
+                <div className={`w-2 h-2 rounded-full ${MODE_DOT_COLORS[appMode]}`} />
+                <span className="text-[13px] font-semibold uppercase tracking-widest">
+                  {appMode}
+                </span>
+                {isListening && (
+                  <svg className="w-3.5 h-3.5 opacity-60 animate-pulse ml-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
+                  </svg>
+                )}
+              </div>
+              {modeStatus && (
+                <p className="mt-1.5 text-[11px] text-white/40 max-w-[200px] leading-tight pl-1">
+                  {modeStatus}
+                </p>
+              )}
+            </div>
+
+            {/* Nav links — top right */}
+            <div className="absolute top-4 right-4 z-30 flex gap-2">
+              <Link
+                href="/stream"
+                className="h-9 px-3.5 flex items-center gap-1.5 rounded-full bg-white/[0.08] backdrop-blur-xl border border-white/[0.12] text-white/70 text-[13px] font-medium transition-colors active:bg-white/[0.15]"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3v11.25A2.25 2.25 0 0 0 6 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0 1 18 16.5h-2.25m-7.5 0h7.5m-7.5 0-1 3m8.5-3 1 3m0 0 .5 1.5m-.5-1.5h-9.5m0 0-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6" />
+                </svg>
+                Live
+              </Link>
+              <Link
+                href="/inventory"
+                className="h-9 px-3.5 flex items-center gap-1.5 rounded-full bg-white/[0.08] backdrop-blur-xl border border-white/[0.12] text-white/70 text-[13px] font-medium transition-colors active:bg-white/[0.15]"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 0 1 0 3.75H5.625a1.875 1.875 0 0 1 0-3.75Z" />
+                </svg>
+                Items
+              </Link>
+            </div>
+          </>
         )}
       </div>
 
@@ -414,8 +625,105 @@ export default function Home() {
               />
             )}
           </button>
+
         </div>
       </div>
     </div>
   );
+}
+
+/** Levenshtein edit distance between two strings. */
+function levenshtein(a: string, b: string): number {
+  if (a.length < b.length) return levenshtein(b, a);
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 0; i < a.length; i++) {
+    const curr = [i + 1];
+    for (let j = 0; j < b.length; j++) {
+      curr.push(Math.min(
+        prev[j + 1] + 1,
+        curr[j] + 1,
+        prev[j] + (a[i] !== b[j] ? 1 : 0),
+      ));
+    }
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+const WAKE_RE = /\b(jarvis|jarvas|jarves|jarvus|jarv[iy]s|jarbus|gervis|jervis|jarv|jarb[iy]s|jarfis|jarbis|service|java[s']?|travis|elvis)\b/i;
+
+const MODE_ANCHORS: Record<AppMode, string[]> = {
+  receive: ["receive", "receiving", "received", "reseive", "recieve", "resiv", "receipt", "recede", "believe", "retrieve", "receiv"],
+  load: ["load", "loading", "loaded", "lode", "lowed", "loud", "loat", "lote", "lord", "lod", "loader"],
+  count: ["count", "counting", "counted", "cound", "mount", "caunt", "cant", "kount", "coun", "recount", "account", "county", "counter"],
+};
+
+/** Detect wake word + fuzzy-match mode from transcribed text. */
+function detectMode(text: string): AppMode | null {
+  const match = WAKE_RE.exec(text);
+  if (!match) return null;
+
+  const after = text.slice(match.index + match[0].length).trim();
+  if (!after) return null;
+
+  const words = after.toLowerCase().match(/[a-z]+/g);
+  if (!words) return null;
+
+  let bestMode: AppMode | null = null;
+  let bestDist = 999;
+
+  for (const [mode, anchors] of Object.entries(MODE_ANCHORS) as [AppMode, string[]][]) {
+    for (const word of words) {
+      for (const anchor of anchors) {
+        const d = levenshtein(word, anchor);
+        if (d < bestDist) {
+          bestDist = d;
+          bestMode = mode;
+        }
+      }
+    }
+  }
+
+  return bestDist <= 3 ? bestMode : null;
+}
+
+/**
+ * Encode 16-bit PCM samples into a WAV file buffer.
+ */
+function encodeWav(samples: Int16Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, "WAVE");
+
+  // fmt chunk
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+
+  // data chunk
+  writeString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  const offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    view.setInt16(offset + i * 2, samples[i], true);
+  }
+
+  return buffer;
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
 }
