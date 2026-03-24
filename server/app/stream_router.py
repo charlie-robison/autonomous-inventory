@@ -15,6 +15,7 @@ from app.facebook_auth import FacebookAuth
 from app.processing import process_frame
 from app.screen_capture import list_windows  # noqa: F401 — used in windows endpoint
 from app.stream_consumer import stream_consumer
+from app.vlm import analyze_frame, scan_qr_code, read_vehicle_number
 
 TEST_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test")
 os.makedirs(TEST_DIR, exist_ok=True)
@@ -506,6 +507,165 @@ async def stream_config():
 async def stream_status():
     """Return the current stream consumer status."""
     return stream_consumer.get_status()
+
+
+# ---------------------------------------------------------------------------
+# Mode-specific WebSocket endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.websocket("/ws/count")
+async def count_ws(websocket: WebSocket):
+    """WebSocket endpoint for Count mode.
+
+    Client sends binary JPEG frames. Each frame is passed through the VLM
+    (analyze_frame), then through the inventory processing pipeline.
+    Results are sent back and broadcast to stream-results listeners.
+    """
+    await websocket.accept()
+    logger.info("Count mode WebSocket client connected")
+    seq = 0
+
+    try:
+        while True:
+            data = await websocket.receive()
+
+            if "text" in data:
+                continue
+
+            image_bytes = data.get("bytes")
+            if not image_bytes:
+                continue
+
+            seq += 1
+
+            # 1. Call VLM stub — returns detected items
+            vlm_items = await analyze_frame(image_bytes)
+
+            # 2. Pass through the full count processing pipeline
+            #    (saves frame, updates DB inventory)
+            results = []
+            try:
+                results = await process_frame(image_bytes)
+            except Exception as e:
+                logger.error("Count WS processing error: %s", e)
+                await websocket.send_json({"status": "error", "message": str(e)})
+                continue
+
+            # 3. Broadcast to frontend stream-results listeners
+            payload = {
+                "frame_number": seq,
+                "timestamp": time.time(),
+                "items_updated": results,
+                "vlm_raw": vlm_items,
+                "source": "count_ws",
+            }
+            await stream_consumer.broadcast(payload)
+
+            # 4. Reply to client
+            await websocket.send_json({
+                "status": "ok",
+                "frame_number": seq,
+                "items_updated": results,
+                "vlm_raw": vlm_items,
+            })
+
+    except WebSocketDisconnect:
+        logger.info("Count mode WebSocket client disconnected")
+    except Exception:
+        logger.exception("Count WebSocket error")
+
+
+@router.websocket("/ws/scan-qr")
+async def scan_qr_ws(websocket: WebSocket):
+    """Detection-only WebSocket: scan a QR code from a frame.
+
+    Client sends a single binary JPEG frame.
+    Server replies with the decoded QR data (pallet_id) and closes.
+    No pipeline is executed — the frontend must call the REST API after
+    user approval.
+    """
+    await websocket.accept()
+    logger.info("=== SCAN-QR WS: client connected ===")
+
+    try:
+        while True:
+            data = await websocket.receive()
+
+            if data.get("type") == "websocket.disconnect":
+                logger.info("SCAN-QR WS: disconnect message")
+                break
+
+            if "text" in data:
+                logger.info("SCAN-QR WS: received text (ignoring): %s", data["text"][:100])
+                continue
+
+            image_bytes = data.get("bytes")
+            if not image_bytes:
+                logger.warning("SCAN-QR WS: received message with no bytes, keys=%s", list(data.keys()))
+                continue
+
+            logger.info("SCAN-QR WS: received frame (%d bytes), scanning for QR...", len(image_bytes))
+            qr_data = await scan_qr_code(image_bytes)
+            logger.info("SCAN-QR WS: scan_qr_code returned: %s", qr_data)
+
+            if qr_data and qr_data.get("pallet_id"):
+                await websocket.send_json({
+                    "status": "ok",
+                    "pallet_id": qr_data["pallet_id"],
+                    "raw": qr_data.get("raw"),
+                })
+            else:
+                await websocket.send_json({
+                    "status": "error",
+                    "message": "No QR code detected in frame",
+                })
+
+    except WebSocketDisconnect:
+        logger.info("SCAN-QR WS: client disconnected")
+    except Exception:
+        logger.exception("SCAN-QR WS: error")
+
+
+@router.websocket("/ws/scan-vehicle")
+async def scan_vehicle_ws(websocket: WebSocket):
+    """Detection-only WebSocket: read a vehicle number from a frame.
+
+    Client sends a single binary JPEG frame.
+    Server replies with the detected vehicle name/number.
+    No pipeline is executed.
+    """
+    await websocket.accept()
+    logger.info("scan-vehicle WebSocket client connected")
+
+    try:
+        while True:
+            data = await websocket.receive()
+
+            if "text" in data:
+                continue
+
+            image_bytes = data.get("bytes")
+            if not image_bytes:
+                continue
+
+            vehicle_name = await read_vehicle_number(image_bytes)
+
+            if vehicle_name:
+                await websocket.send_json({
+                    "status": "ok",
+                    "vehicle_name": vehicle_name,
+                })
+            else:
+                await websocket.send_json({
+                    "status": "error",
+                    "message": "No vehicle number detected in frame",
+                })
+
+    except WebSocketDisconnect:
+        logger.info("scan-vehicle WebSocket client disconnected")
+    except Exception:
+        logger.exception("scan-vehicle WebSocket error")
 
 
 @router.websocket("/ws/stream-results")

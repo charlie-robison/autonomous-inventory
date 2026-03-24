@@ -11,41 +11,36 @@ Flow (business logic only — WebSocket/glasses streaming handled elsewhere):
 
 from app.database import (
     create_vehicle,
-    get_pallet,
+    get_or_create_pallet,
     get_vehicle_by_name,
     update_pallet,
 )
 from app.vlm import scan_qr_code, read_vehicle_number
 
 
-async def load_pallet(pallet_id: str, vehicle_name: str) -> dict:
+async def load_pallet(pallet_name: str, vehicle_name: str) -> dict:
     """Execute the full load pipeline for a single pallet.
 
     Args:
-        pallet_id: The pallet's database id (from QR code).
+        pallet_name: The pallet name from QR code (e.g. "H123").
         vehicle_name: The vehicle/truck name or number read from the truck.
 
     Returns:
         The updated pallet document.
 
     Raises:
-        ValueError: If pallet or vehicle not found.
+        ValueError: If vehicle not found.
     """
-    # 1. Look up pallet
-    pallet = await get_pallet(pallet_id)
-    if pallet is None:
-        raise ValueError(f"Pallet '{pallet_id}' not found in database")
+    # 1. Find or create pallet by name
+    pallet = await get_or_create_pallet(pallet_name)
 
-    # 2. Look up vehicle by name/number
+    # 2. Look up or create vehicle by name/number
     vehicle = await get_vehicle_by_name(vehicle_name)
     if vehicle is None:
-        raise ValueError(
-            f"Vehicle '{vehicle_name}' not found in database. "
-            "Register the vehicle first."
-        )
+        vehicle = await create_vehicle(vehicle_name)
 
     # 3. Update pallet: status=loaded, vehicle_fk=vehicle id, warehouse_fk=null
-    updated = await update_pallet(pallet_id, {
+    updated = await update_pallet(pallet["id"], {
         "status": "loaded",
         "vehicle_fk": vehicle["id"],
         "warehouse_fk": None,
@@ -54,28 +49,17 @@ async def load_pallet(pallet_id: str, vehicle_name: str) -> dict:
 
 
 async def load_pallet_from_frame(image_bytes: bytes) -> dict:
-    """High-level entry: extract pallet id and vehicle number from a frame, then run load pipeline.
-
-    This is the method you'll call once the VLM + QR/OCR scanning is wired up.
-
-    Args:
-        image_bytes: Raw image bytes containing a QR code and visible vehicle number.
-
-    Returns:
-        The updated pallet document.
-    """
-    # Extract QR code data (pallet id)
+    """High-level entry: extract pallet name and vehicle number from a frame, then run load pipeline."""
     qr_data = await scan_qr_code(image_bytes)
     if qr_data is None:
         raise ValueError("No QR code detected in frame")
 
-    pallet_id = qr_data.get("pallet_id")
-    if pallet_id is None:
-        raise ValueError(f"QR code does not contain a pallet_id: {qr_data}")
+    pallet_name = qr_data.get("pallet_id")
+    if pallet_name is None:
+        raise ValueError(f"QR code does not contain a pallet name: {qr_data}")
 
-    # Extract vehicle number from the same or subsequent frame
     vehicle_name = await read_vehicle_number(image_bytes)
     if vehicle_name is None:
         raise ValueError("Could not read vehicle number from frame")
 
-    return await load_pallet(pallet_id, vehicle_name)
+    return await load_pallet(pallet_name, vehicle_name)

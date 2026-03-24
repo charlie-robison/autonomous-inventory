@@ -37,7 +37,12 @@ interface RTMPInfo {
 
 type Mode = "dat" | "rtmp" | "facebook-url" | "url" | "screen-capture" | "phone";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = typeof window !== "undefined"
+  ? `${window.location.protocol}//${window.location.host}`
+  : "";
+const WS_BASE = typeof window !== "undefined"
+  ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`
+  : "ws://localhost:8000";
 
 export default function StreamPage() {
   const [mode, setMode] = useState<Mode>("dat");
@@ -82,7 +87,7 @@ export default function StreamPage() {
 
   // WebSocket connection for real-time results
   useEffect(() => {
-    const ws = new WebSocket(`ws://localhost:8000/api/stream/ws/stream-results`);
+    const ws = new WebSocket(`${WS_BASE}/api/stream/ws/stream-results`);
 
     ws.onmessage = (event) => {
       const data: FrameResult = JSON.parse(event.data);

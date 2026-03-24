@@ -215,6 +215,7 @@ VALID_PALLET_STATUSES = ("on_boat", "on_port", "received", "loaded")
 
 
 async def create_pallet(
+    name: str | None = None,
     status: str = "on_port",
     warehouse_fk: str | None = None,
     vehicle_fk: str | None = None,
@@ -224,6 +225,7 @@ async def create_pallet(
         raise ValueError(f"Invalid status '{status}'. Must be one of {VALID_PALLET_STATUSES}")
     collection = get_pallets_collection()
     doc = {
+        "name": name,
         "status": status,
         "warehouse_fk": warehouse_fk,
         "vehicle_fk": vehicle_fk,
@@ -238,8 +240,26 @@ async def create_pallet(
 async def get_pallet(pallet_id: str) -> dict | None:
     """Look up a pallet by its _id."""
     collection = get_pallets_collection()
-    doc = await collection.find_one({"_id": ObjectId(pallet_id)})
+    try:
+        doc = await collection.find_one({"_id": ObjectId(pallet_id)})
+    except Exception:
+        return None
     return _serialize(doc) if doc else None
+
+
+async def get_pallet_by_name(name: str) -> dict | None:
+    """Case-insensitive lookup of a pallet by name."""
+    collection = get_pallets_collection()
+    doc = await collection.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
+    return _serialize(doc) if doc else None
+
+
+async def get_or_create_pallet(name: str) -> dict:
+    """Find a pallet by name, or create a new one with status 'on_port'."""
+    pallet = await get_pallet_by_name(name)
+    if pallet:
+        return pallet
+    return await create_pallet(name=name, status="on_port")
 
 
 async def update_pallet(pallet_id: str, updates: dict) -> dict | None:
