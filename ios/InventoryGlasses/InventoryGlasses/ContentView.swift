@@ -1,173 +1,178 @@
 import SwiftUI
-import AVFoundation
 
 struct ContentView: View {
     @StateObject private var glasses = GlassesSession()
-    @StateObject private var uploader = FrameUploader()
+    @StateObject private var appState = AppState()
+    @StateObject private var pipeline = PipelineService()
+    @StateObject private var audio = AudioService()
+    @StateObject private var location = LocationService()
 
-    @AppStorage("serverIP") private var serverIP = ""
-    @State private var isStreaming = false
+    private let serverIP = "https://kizzy-nonturbinated-nonpromiscuously.ngrok-free.dev"
+    @State private var pollTask: Task<Void, Never>?
+    @State private var debugLog: String = ""
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 20) {
-                // Server configuration
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Server IP")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    TextField("e.g. 192.168.1.100", text: $serverIP)
-                        .textFieldStyle(.roundedBorder)
-                        .keyboardType(.decimalPad)
-                        .autocorrectionDisabled()
-                }
-                .padding(.horizontal)
+        ZStack {
+            rootNavigation
 
-                // Live preview
-                if let image = glasses.latestImage {
-                    Image(uiImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxHeight: 300)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(alignment: .topTrailing) {
-                            Text(glasses.source == .glasses ? "Glasses" : "Camera")
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(.ultraThinMaterial)
-                                .clipShape(Capsule())
-                                .padding(8)
-                        }
-                        .padding(.horizontal)
-                } else {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color(.systemGray6))
-                        .frame(height: 200)
-                        .overlay {
-                            VStack(spacing: 8) {
-                                Image(systemName: "eyeglasses")
-                                    .font(.system(size: 40))
-                                    .foregroundStyle(.secondary)
-                                Text(glasses.statusMessage.isEmpty
-                                     ? (glasses.isConnected ? "Starting..." : "No video feed")
-                                     : glasses.statusMessage)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.horizontal)
-                }
-
-                // Status indicators
-                HStack(spacing: 24) {
-                    StatusBadge(
-                        label: glasses.source == .glasses ? "Glasses" : "Camera",
-                        connected: glasses.isConnected
-                    )
-                    StatusBadge(
-                        label: "Server",
-                        connected: uploader.isConnected
-                    )
-                    VStack {
-                        Text("\(uploader.framesSent)")
-                            .font(.title2.monospacedDigit().bold())
-                        Text("Frames")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                // Registration button (only show if not registered and not on simulator)
-                #if !targetEnvironment(simulator)
-                if !glasses.isRegistered {
-                    Button {
-                        glasses.register()
-                    } label: {
-                        HStack {
-                            Image(systemName: "link.badge.plus")
-                            Text("Connect Meta Glasses")
-                        }
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .padding(.horizontal)
-                }
-                #endif
-
-                // Start/Stop upload button
-                Button {
-                    if isStreaming {
-                        stopStreaming()
-                    } else {
-                        startStreaming()
-                    }
-                } label: {
-                    Text(isStreaming ? "Stop Uploading" : "Start Uploading")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(isStreaming ? .red : .green)
-                .disabled(serverIP.isEmpty && !isStreaming)
-                .padding(.horizontal)
-
-                // Error display
-                if let error = glasses.error ?? uploader.lastError {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .padding(.horizontal)
-                }
-
+            // Debug overlay — shows connection status on screen
+            VStack {
                 Spacer()
+                Text(debugLog)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.green)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.black.opacity(0.8))
+                    .lineLimit(6)
             }
-            .padding(.top)
-            .navigationTitle("Inventory Glasses")
-            .onAppear {
-                glasses.start()
-            }
-            .onChange(of: glasses.latestImage) { _, newImage in
-                guard isStreaming, let image = newImage else { return }
-                uploader.sendFrame(image)
-            }
+            .allowsHitTesting(false)
         }
-    }
-
-    private func startStreaming() {
-        uploader.connect(serverIP: serverIP)
-        if !glasses.isConnected {
+        .preferredColorScheme(.dark)
+        .onAppear {
             glasses.start()
+            debugLog = "Starting... server=\(serverIP)"
+            testAndStartWithDebug()
         }
-        isStreaming = true
+        .modifier(ModeChangeHandler(appState: appState, location: location, serverIP: serverIP))
+        .modifier(AudioSyncHandler(appState: appState, audio: audio))
+        .modifier(LocationSyncHandler(appState: appState, location: location))
     }
 
-    private func stopStreaming() {
-        uploader.disconnect()
-        isStreaming = false
+    // MARK: - Root Navigation
+
+    private var rootNavigation: some View {
+        NavigationStack {
+            Group {
+                mainContent
+            }
+            .navigationDestination(for: String.self) { route in
+                if route == "inventory" {
+                    InventoryView()
+                }
+            }
+        }
+    }
+
+    // MARK: - Main Content (view state router)
+
+    @ViewBuilder
+    private var mainContent: some View {
+        switch appState.viewState {
+        case .idle, .processing:
+            ScanView(appState: appState, glasses: glasses, pipeline: pipeline)
+        case .pendingApproval:
+            ApprovalView(appState: appState)
+        case .results:
+            ResultsView(appState: appState)
+        }
+    }
+
+    // MARK: - Connection Test + Services
+
+    private func testAndStartWithDebug() {
+        let base = ServerURL.http(serverIP)
+        debugLog = "Testing \(base)/health ..."
+        Task {
+            let err = await APIClient.testConnection(serverIP: serverIP)
+            if let err {
+                debugLog = "FAILED: \(err)\nURL: \(base)/health"
+            } else {
+                debugLog = "Connected! Starting services..."
+                startServices()
+                debugLog = "Connected & running. Mode poll active."
+            }
+        }
+    }
+
+    private func startServices() {
+        print("[App] Starting services with serverIP: \(serverIP)")
+        audio.startListening(serverIP: serverIP)
+
+        pollTask?.cancel()
+        pollTask = Task {
+            while !Task.isCancelled {
+                do {
+                    let mode = try await APIClient.getMode(serverIP: serverIP)
+                    if let appMode = AppMode(rawValue: mode) {
+                        appState.appMode = appMode
+                    }
+                    debugLog = "Poll OK: mode=\(mode)"
+                } catch {
+                    debugLog = "Poll error: \(error.localizedDescription)"
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+
+        if appState.appMode == .receive {
+            location.startTracking()
+        }
     }
 }
 
-// MARK: - Status Badge
+// MARK: - Modifier: Mode Changes
 
-private struct StatusBadge: View {
-    let label: String
-    let connected: Bool
+private struct ModeChangeHandler: ViewModifier {
+    @ObservedObject var appState: AppState
+    @ObservedObject var location: LocationService
+    let serverIP: String
 
-    var body: some View {
-        VStack {
-            Circle()
-                .fill(connected ? Color.green : Color.gray.opacity(0.4))
-                .frame(width: 12, height: 12)
-                .shadow(color: connected ? .green.opacity(0.5) : .clear, radius: 4)
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: appState.appMode) { _, newMode in
+                if newMode == .receive {
+                    location.startTracking()
+                } else {
+                    location.stopTracking()
+                }
+                Task {
+                    try? await APIClient.setMode(serverIP: serverIP, mode: newMode)
+                }
+            }
+    }
+}
+
+// MARK: - Modifier: Audio Sync
+
+private struct AudioSyncHandler: ViewModifier {
+    @ObservedObject var appState: AppState
+    @ObservedObject var audio: AudioService
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: audio.detectedMode) { _, newMode in
+                if let mode = newMode {
+                    appState.appMode = mode
+                    audio.detectedMode = nil
+                }
+            }
+            .onChange(of: audio.isListening) { _, val in
+                appState.isListening = val
+            }
+            .onChange(of: audio.isTranscribing) { _, val in
+                appState.isTranscribing = val
+            }
+            .onChange(of: audio.modeStatus) { _, val in
+                appState.modeStatus = val
+            }
+    }
+}
+
+// MARK: - Modifier: Location Sync
+
+private struct LocationSyncHandler: ViewModifier {
+    @ObservedObject var appState: AppState
+    @ObservedObject var location: LocationService
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: location.coords) { _, coords in
+                appState.gpsCoords = coords
+            }
+            .onChange(of: location.error) { _, val in
+                appState.gpsError = val
+            }
     }
 }
 

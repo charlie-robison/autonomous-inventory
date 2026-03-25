@@ -25,7 +25,7 @@ targets:
       base:
         INFOPLIST_FILE: InventoryGlasses/Info.plist
         CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: ""
+        DEVELOPMENT_TEAM: L5WQ2DY43Y
         PRODUCT_BUNDLE_IDENTIFIER: com.inventoryglasses.app
         INFOPLIST_KEY_CFBundleDisplayName: "Inventory Glasses"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
