@@ -57,6 +57,8 @@
 	<string>InventoryGlasses uses the microphone for voice commands to switch scanning modes (e.g., say "Jarvis count").</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>InventoryGlasses uses your location to determine the warehouse when receiving pallets.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>InventoryGlasses needs access to your photo library to upload videos for inventory counting.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

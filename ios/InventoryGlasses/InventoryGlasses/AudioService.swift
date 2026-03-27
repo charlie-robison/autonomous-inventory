@@ -12,15 +12,18 @@ final class AudioService: ObservableObject {
     @Published var detectedMode: AppMode?
 
     private var audioEngine: AVAudioEngine?
-    private var pcmBuffer: [Float] = []
     private var listeningTask: Task<Void, Never>?
     private var isRunning = false
+
+    /// Thread-safe buffer for audio samples.
+    private let sampleBuffer = AudioSampleBuffer()
 
     func startListening(serverIP: String) {
         guard !isRunning else { return }
         isRunning = true
         isListening = true
         modeStatus = "Say 'Jarvis' + mode..."
+        print("[Audio] startListening serverIP=\(serverIP)")
 
         listeningTask = Task { [weak self] in
             await self?.listenLoop(serverIP: serverIP)
@@ -41,13 +44,29 @@ final class AudioService: ObservableObject {
     // MARK: - Private
 
     private func listenLoop(serverIP: String) async {
-        // Configure audio session
+        // Wait a moment for camera to finish setting up its session
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        guard isRunning else { return }
+
+        // Configure audio session — retry up to 3 times
         let audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession.setCategory(.record, mode: .measurement)
-            try audioSession.setActive(true)
-        } catch {
-            modeStatus = "Microphone access failed"
+        var configured = false
+        for attempt in 1...3 {
+            do {
+                try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+                try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                print("[Audio] Audio session configured on attempt \(attempt)")
+                configured = true
+                break
+            } catch {
+                print("[Audio] Audio session attempt \(attempt) FAILED: \(error)")
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+            }
+        }
+        guard configured else {
+            modeStatus = "Mic failed — check permissions"
             isRunning = false
             isListening = false
             return
@@ -58,6 +77,7 @@ final class AudioService: ObservableObject {
 
         let inputNode = engine.inputNode
         let nativeFormat = inputNode.outputFormat(forBus: 0)
+        print("[Audio] Native format: \(nativeFormat.sampleRate)Hz, \(nativeFormat.channelCount)ch")
 
         // Target: 16kHz mono Float32
         guard let targetFormat = AVAudioFormat(
@@ -73,15 +93,16 @@ final class AudioService: ObservableObject {
         }
 
         guard let converter = AVAudioConverter(from: nativeFormat, to: targetFormat) else {
+            print("[Audio] Converter creation failed")
             modeStatus = "Audio converter error"
             isRunning = false
             isListening = false
             return
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, _ in
-            guard let self, self.isRunning else { return }
+        let buf = sampleBuffer
 
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { buffer, _ in
             let frameCount = AVAudioFrameCount(
                 Double(buffer.frameLength) * 16000.0 / nativeFormat.sampleRate
             )
@@ -90,27 +111,28 @@ final class AudioService: ObservableObject {
                 return
             }
 
-            var error: NSError?
-            converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
+            var convError: NSError?
+            converter.convert(to: convertedBuffer, error: &convError) { _, outStatus in
                 outStatus.pointee = .haveData
                 return buffer
             }
 
-            if error == nil, let floatData = convertedBuffer.floatChannelData?[0] {
+            if convError == nil, let floatData = convertedBuffer.floatChannelData?[0] {
                 let count = Int(convertedBuffer.frameLength)
                 let samples = Array(UnsafeBufferPointer(start: floatData, count: count))
-                Task { @MainActor in
-                    self.pcmBuffer.append(contentsOf: samples)
-                }
+                buf.append(samples)
             }
         }
 
         do {
             try engine.start()
+            print("[Audio] Engine started, listening...")
         } catch {
-            modeStatus = "Microphone start failed"
+            print("[Audio] Engine start FAILED: \(error)")
+            modeStatus = "Mic start failed: \(error.localizedDescription)"
             isRunning = false
             isListening = false
+
             return
         }
 
@@ -119,13 +141,19 @@ final class AudioService: ObservableObject {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard isRunning else { break }
 
-            let chunks = pcmBuffer
-            pcmBuffer = []
-            guard !chunks.isEmpty else { continue }
+            let chunks = buf.drain()
+
+            guard !chunks.isEmpty else {
+                print("[Audio] Empty buffer, skipping")
+                continue
+            }
 
             // Skip silence (peak < 0.01)
-            let peak = chunks.reduce(0) { max($0, abs($1)) }
-            guard peak >= 0.01 else { continue }
+            let peak = chunks.reduce(Float(0)) { max($0, abs($1)) }
+            if peak < 0.01 {
+                continue
+            }
+            print("[Audio] Chunk: \(chunks.count) samples, peak=\(String(format: "%.3f", peak))")
 
             // Normalize quiet audio
             let gain: Float = (peak > 0 && peak < 0.25) ? 0.9 / peak : 1.0
@@ -143,16 +171,32 @@ final class AudioService: ObservableObject {
             }
 
             isTranscribing = true
+            modeStatus = "Transcribing..."
             let text = await transcribe(pcm16: pcm16, serverIP: serverIP)
             isTranscribing = false
 
-            guard isRunning, !text.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            guard isRunning else { break }
+
+            if text.trimmingCharacters(in: .whitespaces).isEmpty {
+                modeStatus = "Say 'Jarvis' + mode..."
+                continue
+            }
+
+            print("[Audio] Transcription: \"\(text)\"")
+            modeStatus = "Heard: \"\(text)\""
 
             if let mode = Self.detectMode(text) {
-                modeStatus = "Heard \"\(text)\" — setting \(mode.rawValue)..."
+                print("[Audio] Mode detected: \(mode.rawValue)")
+                modeStatus = "Heard \"\(text)\" → \(mode.rawValue)"
                 detectedMode = mode
 
-                // Brief pause before resetting status
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if isRunning {
+                    modeStatus = "Say 'Jarvis' + mode..."
+                }
+            } else {
+                print("[Audio] No mode matched in: \"\(text)\"")
+                // Show what was heard briefly
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if isRunning {
                     modeStatus = "Say 'Jarvis' + mode..."
@@ -164,13 +208,17 @@ final class AudioService: ObservableObject {
         inputNode.removeTap(onBus: 0)
         self.audioEngine = nil
         isListening = false
+        print("[Audio] Stopped")
     }
 
     /// Send PCM to a fresh audio WebSocket and get transcription back.
     private func transcribe(pcm16: Data, serverIP: String) async -> String {
-        await withCheckedContinuation { continuation in
-            let urlString = "\(ServerURL.ws(serverIP))/ws/audio-stream"
+        let urlString = "\(ServerURL.ws(serverIP))/ws/audio-stream"
+        print("[Audio] Transcribe via \(urlString) (\(pcm16.count) bytes)")
+
+        return await withCheckedContinuation { continuation in
             guard let url = URL(string: urlString) else {
+                print("[Audio] Bad URL: \(urlString)")
                 continuation.resume(returning: "")
                 return
             }
@@ -191,6 +239,7 @@ final class AudioService: ObservableObject {
             // 10-second timeout
             Task {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
+                print("[Audio] Transcribe timeout")
                 resolveOnce("")
             }
 
@@ -203,16 +252,21 @@ final class AudioService: ObservableObject {
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                             let type = json["type"] as? String
                             if type == "status", json["message"] as? String == "ready" {
-                                // Send PCM audio
-                                ws.send(.data(pcm16)) { _ in
-                                    // Send transcribe command
+                                print("[Audio] WS ready, sending PCM...")
+                                ws.send(.data(pcm16)) { err in
+                                    if let err { print("[Audio] PCM send error: \(err)") }
                                     let cmd = "{\"action\":\"transcribe\"}"
-                                    ws.send(.string(cmd)) { _ in }
+                                    ws.send(.string(cmd)) { err in
+                                        if let err { print("[Audio] CMD send error: \(err)") }
+                                    }
                                 }
                                 listen()
                             } else if type == "transcription" {
-                                resolveOnce(json["text"] as? String ?? "")
+                                let result = json["text"] as? String ?? ""
+                                print("[Audio] Got transcription: \"\(result)\"")
+                                resolveOnce(result)
                             } else if type == "error" {
+                                print("[Audio] Server error: \(json)")
                                 resolveOnce("")
                             } else {
                                 listen()
@@ -220,7 +274,8 @@ final class AudioService: ObservableObject {
                         } else {
                             listen()
                         }
-                    case .failure:
+                    case .failure(let error):
+                        print("[Audio] WS receive error: \(error)")
                         resolveOnce("")
                     }
                 }
@@ -297,5 +352,27 @@ final class AudioService: ObservableObject {
             prev = curr
         }
         return prev[b.count]
+    }
+}
+
+// MARK: - Thread-safe sample buffer
+
+/// Simple thread-safe float buffer using os_unfair_lock (safe from any thread).
+final class AudioSampleBuffer: @unchecked Sendable {
+    private var storage: [Float] = []
+    private var lock = os_unfair_lock()
+
+    func append(_ samples: [Float]) {
+        os_unfair_lock_lock(&lock)
+        storage.append(contentsOf: samples)
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func drain() -> [Float] {
+        os_unfair_lock_lock(&lock)
+        let result = storage
+        storage = []
+        os_unfair_lock_unlock(&lock)
+        return result
     }
 }

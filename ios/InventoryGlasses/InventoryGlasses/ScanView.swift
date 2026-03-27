@@ -1,3 +1,5 @@
+import AVFoundation
+import PhotosUI
 import SwiftUI
 
 /// Main scanning interface — covers idle and processing view states.
@@ -11,6 +13,9 @@ struct ScanView: View {
     @State private var scanLinePosition: CGFloat = 0.15
     @State private var bracketOpacity: Double = 0.6
     @State private var shimmerOffset: CGFloat = -200
+    @State private var showVideoPicker = false
+    @State private var selectedVideoItem: PhotosPickerItem?
+    @State private var videoProcessingStatus: String = ""
 
     private var isProcessing: Bool { appState.viewState == .processing }
     private var colors: ModeColors { ModeColors.forMode(appState.appMode) }
@@ -366,7 +371,15 @@ struct ScanView: View {
             if isProcessing {
                 ShimmerBar()
                     .frame(maxWidth: 200, maxHeight: 4)
-                    .padding(.bottom, 24)
+                    .padding(.bottom, 12)
+            }
+
+            // Video processing status
+            if !videoProcessingStatus.isEmpty {
+                Text(videoProcessingStatus)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color(hex: 0x34D399, opacity: 0.8))
+                    .padding(.bottom, 12)
             }
 
             // GPS warning for receive mode
@@ -377,34 +390,64 @@ struct ScanView: View {
                     .padding(.bottom, 16)
             }
 
-            // Capture button
-            Button {
-                if appState.viewState == .idle {
-                    handleCapture()
+            // Buttons row
+            HStack(spacing: 24) {
+                // Upload video button (count mode only)
+                if appState.appMode == .count && !isProcessing {
+                    PhotosPicker(
+                        selection: $selectedVideoItem,
+                        matching: .videos
+                    ) {
+                        VStack(spacing: 4) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 20))
+                                .foregroundStyle(.white.opacity(0.7))
+                            Text("Upload")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                        .frame(width: 52, height: 52)
+                    }
+                    .onChange(of: selectedVideoItem) { _, newItem in
+                        if let item = newItem {
+                            handleVideoUpload(item: item)
+                            selectedVideoItem = nil
+                        }
+                    }
                 }
-            } label: {
-                ZStack {
-                    // Outer ring
-                    Circle()
-                        .stroke(Color.white.opacity(0.8), lineWidth: 3)
-                        .frame(width: 76, height: 76)
-                    // Inner circle
-                    Circle()
-                        .fill(isProcessing ? Color.white.opacity(0.2) : Color.white)
-                        .frame(width: isProcessing ? 56 : 62, height: isProcessing ? 56 : 62)
-                        .animation(.easeInOut(duration: 0.2), value: isProcessing)
+
+                // Capture button
+                Button {
+                    if appState.viewState == .idle {
+                        handleCapture()
+                    }
+                } label: {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.white.opacity(0.8), lineWidth: 3)
+                            .frame(width: 76, height: 76)
+                        Circle()
+                            .fill(isProcessing ? Color.white.opacity(0.2) : Color.white)
+                            .frame(width: isProcessing ? 56 : 62, height: isProcessing ? 56 : 62)
+                            .animation(.easeInOut(duration: 0.2), value: isProcessing)
+                    }
+                }
+                .disabled(
+                    glasses.latestImage == nil
+                    || isProcessing
+                    || (appState.appMode == .receive && appState.viewState == .idle && appState.gpsCoords == nil)
+                )
+                .opacity(
+                    (glasses.latestImage == nil
+                     || (appState.appMode == .receive && appState.viewState == .idle && appState.gpsCoords == nil))
+                    ? 0.3 : 1
+                )
+
+                // Spacer to balance layout when upload button is shown
+                if appState.appMode == .count && !isProcessing {
+                    Color.clear.frame(width: 52, height: 52)
                 }
             }
-            .disabled(
-                glasses.latestImage == nil
-                || isProcessing
-                || (appState.appMode == .receive && appState.viewState == .idle && appState.gpsCoords == nil)
-            )
-            .opacity(
-                (glasses.latestImage == nil
-                 || (appState.appMode == .receive && appState.viewState == .idle && appState.gpsCoords == nil))
-                ? 0.3 : 1
-            )
         }
         .padding(.bottom, 40)
         .background(
@@ -412,7 +455,7 @@ struct ScanView: View {
                 colors: [.black, .black.opacity(0.95), .black.opacity(0.8)],
                 startPoint: .bottom, endPoint: .top
             )
-            .frame(height: 160)
+            .frame(height: 180)
             .offset(y: 40),
             alignment: .bottom
         )
@@ -513,6 +556,85 @@ struct ScanView: View {
         }
     }
 
+    // MARK: - Video Upload
+
+    private func handleVideoUpload(item: PhotosPickerItem) {
+        appState.viewState = .processing
+        appState.apiError = ""
+        videoProcessingStatus = "Loading video..."
+
+        Task {
+            do {
+                guard let movie = try await item.loadTransferable(type: VideoTransferable.self) else {
+                    appState.apiError = "Could not load video"
+                    appState.viewState = .idle
+                    videoProcessingStatus = ""
+                    return
+                }
+
+                let frames = try await extractFrames(from: movie.url, maxFrames: 10, intervalSeconds: 2.0)
+                videoProcessingStatus = "Extracted \(frames.count) frames"
+
+                var allResults: [ScanResult] = []
+                for (i, frame) in frames.enumerated() {
+                    videoProcessingStatus = "Processing frame \(i + 1)/\(frames.count)..."
+                    do {
+                        let items = try await pipeline.sendToCount(image: frame, serverIP: serverIP)
+                        for item in items {
+                            if let existing = allResults.firstIndex(where: { $0.name == item.name }) {
+                                let old = allResults[existing]
+                                allResults[existing] = ScanResult(name: old.name, count: max(old.count, item.count))
+                            } else {
+                                allResults.append(item)
+                            }
+                        }
+                    } catch {
+                        // Skip failed frames, continue with the rest
+                        print("[Video] Frame \(i + 1) failed: \(error)")
+                    }
+                }
+
+                appState.results = allResults
+                videoProcessingStatus = ""
+                appState.viewState = .results
+            } catch {
+                appState.apiError = "Video error: \(error.localizedDescription)"
+                appState.viewState = .idle
+                videoProcessingStatus = ""
+            }
+        }
+    }
+
+    /// Extract evenly-spaced frames from a video file.
+    private func extractFrames(from url: URL, maxFrames: Int, intervalSeconds: Double) async throws -> [UIImage] {
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        let durationSeconds = CMTimeGetSeconds(duration)
+        guard durationSeconds > 0 else { return [] }
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1280, height: 720)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+
+        let step = max(intervalSeconds, durationSeconds / Double(maxFrames))
+        var times: [CMTime] = []
+        var t = 0.0
+        while t < durationSeconds && times.count < maxFrames {
+            times.append(CMTime(seconds: t, preferredTimescale: 600))
+            t += step
+        }
+
+        var images: [UIImage] = []
+        for time in times {
+            if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                images.append(UIImage(cgImage: cgImage))
+            }
+        }
+        return images
+    }
+
     // MARK: - Animations
 
     private func startAnimations() {
@@ -569,6 +691,24 @@ private struct CornerBracket: View {
             context.stroke(path, with: .color(color), lineWidth: lineWidth)
         }
         .frame(width: size, height: size)
+    }
+}
+
+// MARK: - Video Transferable
+
+struct VideoTransferable: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { video in
+            SentTransferredFile(video.url)
+        } importing: { received in
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension("mov")
+            try FileManager.default.copyItem(at: received.file, to: tempURL)
+            return Self(url: tempURL)
+        }
     }
 }
 
